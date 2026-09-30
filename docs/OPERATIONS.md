@@ -81,7 +81,20 @@ re-runnable. Take a backup before applying anything destructive.
 - Customers, suppliers and products that appear on any transaction cannot be
   deleted; financial history is preserved.
 
-## 5. Known limitations (be aware before go-live)
+## 5. Token verification (how sign-in actually gets checked)
+
+Supabase signs sign-in tokens one of two ways depending on when a project
+was created: an older shared-secret method (HS256), or the current default,
+a public/private key pair (ES256 or RS256). The backend (`src/auth.js`)
+detects which one each token uses and verifies it correctly either way, with
+no configuration needed for the current default — `SUPABASE_JWT_SECRET` is
+only read for projects still on the legacy method.
+
+This logic is covered by real cryptographic tests (self-signed test tokens
+for both methods, including tampered signatures, wrong keys, unknown key
+IDs, and expired tokens), not just a syntax check.
+
+## 6. Known limitations (be aware before go-live)
 
 - **Non-Latin text in PDF invoices.** The invoice PDF uses built-in fonts
   that only cover Latin characters; anything else (e.g. Devanagari in a
