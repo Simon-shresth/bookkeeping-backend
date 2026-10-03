@@ -139,6 +139,34 @@ users (`/api/users/*`) requires `admin`.
   applies `db/schema.sql` once and everything in `db/migrations/` in order,
   tracked so nothing re-runs). See `docs/OPERATIONS.md`.
 
+## What's new in this round of changes
+
+- **Nepali number formatting** — every amount (screen and PDF) now uses
+  lakh/crore digit grouping (e.g. Rs. 12,34,567.89) via `src/services/numberFormat.js`.
+- **Multiple products per invoice** — Sales and Purchases are now a header +
+  line-items model (`sales_invoice_lines` / `purchase_invoice_lines`), not
+  one product per invoice. **This is a breaking schema change** — back up
+  your database before running `npm run migrate` if it has real entries;
+  existing single-product sales/purchases cannot be carried forward
+  automatically (see the migration file's note for why).
+- **Units of measurement** — every product has a unit (pcs, kg, ltr, etc.),
+  shown throughout Sales/Purchases/Products and snapshotted onto each line
+  item at the time of the transaction.
+- **Cash Sale and Discount** (Sales only) — a cash sale bypasses Accounts
+  Receivable entirely; a discount posts to a new "Discount Allowed" expense
+  account rather than silently reducing reported revenue.
+- **Invoices and payments are now separate, linked ledger entries** — an
+  invoice always posts its full amount to AR/AP; any amount paid at the time
+  of invoicing is recorded as its own linked payment (`src/services/payments.js`),
+  so the General Ledger shows the real invoice and the real payment against
+  it, not a pre-netted outstanding figure. Aging reports account for this to
+  avoid double-counting.
+- **General Ledger PDF export** — `GET /api/ledger/:accountId/pdf?from=&till=`,
+  with a real computed opening balance for the period.
+- **Search in Sales/Purchases** only queries the server on Enter/Search-click,
+  not on every keystroke (frontend change, mentioned here since it affects
+  how you'll use these endpoints during testing).
+
 ## What's next (later phases)
 
 - **Phase 2**: React frontend, calling this API, replacing the current

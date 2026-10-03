@@ -3,13 +3,26 @@ const { z } = require('zod');
 const { pool, withTransaction } = require('../db');
 const { requireRole } = require('../auth');
 const { postJournal, reverseJournalEntry } = require('../services/ledger');
-const { audit } = require('../services/audit');
+const { createPaymentWithinTx, reverseLinkedPaymentsWithinTx } = require('../services/payments');
 const { companyToday } = require('../services/dates');
+const { audit } = require('../services/audit');
 const { buildSalesInvoicePdf } = require('../services/invoicePdf');
 
 const router = express.Router();
 
-// GET /api/sales?q=search — list with customer/product names joined, newest first
+async function attachLines(invoices) {
+  if (!invoices.length) return invoices;
+  const { rows: lines } = await pool.query(
+    `select sl.*, p.name as product_name from sales_invoice_lines sl join products p on p.id = sl.product_id
+     where sl.sales_invoice_id = any($1::uuid[]) order by sl.id`,
+    [invoices.map((i) => i.id)]
+  );
+  const byInvoice = {};
+  for (const l of lines) (byInvoice[l.sales_invoice_id] ||= []).push(l);
+  return invoices.map((i) => ({ ...i, lines: byInvoice[i.id] || [] }));
+}
+
+// GET /api/sales?q=search
 router.get('/', async (req, res, next) => {
   try {
     const q = (req.query.q || '').trim();
@@ -17,19 +30,21 @@ router.get('/', async (req, res, next) => {
     let where = 'where s.company_id = $1';
     if (q) {
       params.push(`%${q}%`);
-      where += ` and (s.invoice_number ilike $2 or c.name ilike $2 or p.name ilike $2)`;
+      where += ` and (s.invoice_number ilike $2 or c.name ilike $2 or exists (
+        select 1 from sales_invoice_lines sl join products p on p.id = sl.product_id
+        where sl.sales_invoice_id = s.id and p.name ilike $2
+      ))`;
     }
     const { rows } = await pool.query(
-      `select s.*, c.name as customer_name, p.name as product_name, a.name as account_name
+      `select s.*, c.name as customer_name, a.name as account_name
        from sales_invoices s
        join customers c on c.id = s.customer_id
-       join products p on p.id = s.product_id
        left join accounts a on a.id = s.payment_account_id
        ${where}
        order by s.date desc, s.created_at desc`,
       params
     );
-    res.json(rows);
+    res.json(await attachLines(rows));
   } catch (err) { next(err); }
 });
 
@@ -38,11 +53,10 @@ router.get('/:id/pdf', async (req, res, next) => {
   try {
     const companyId = req.user.company_id;
     const { rows } = await pool.query(
-      `select s.*, c.name as customer_name, c.contact as customer_contact, p.name as product_name,
+      `select s.*, c.name as customer_name, c.contact as customer_contact,
               a.name as account_name, co.name as company_name, co.currency
        from sales_invoices s
        join customers c on c.id = s.customer_id
-       join products p on p.id = s.product_id
        join companies co on co.id = s.company_id
        left join accounts a on a.id = s.payment_account_id
        where s.id = $1 and s.company_id = $2`,
@@ -50,12 +64,17 @@ router.get('/:id/pdf', async (req, res, next) => {
     );
     const r = rows[0];
     if (!r) return res.status(404).json({ error: 'Not found' });
+    const { rows: lines } = await pool.query(
+      `select sl.*, p.name as product_name from sales_invoice_lines sl join products p on p.id = sl.product_id
+       where sl.sales_invoice_id = $1 order by sl.id`,
+      [req.params.id]
+    );
 
     const pdf = await buildSalesInvoicePdf({
       company: { name: r.company_name, currency: r.currency },
       sale: r,
       customer: { name: r.customer_name, contact: r.customer_contact },
-      product: { name: r.product_name },
+      lines: lines.map((l) => ({ name: l.product_name, unit: l.unit, qty: l.qty, price: l.price, lineTotal: l.line_total })),
       paymentAccount: r.account_name ? { name: r.account_name } : null,
     });
 
@@ -66,70 +85,126 @@ router.get('/:id/pdf', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+const lineSchema = z.object({ productId: z.string().uuid(), qty: z.number().positive(), price: z.number().min(0) });
 const saleSchema = z.object({
   invoiceNumber: z.string().optional(),
   customerId: z.string().uuid(),
-  productId: z.string().uuid(),
-  qty: z.number().positive(),
-  price: z.number().min(0),
+  lines: z.array(lineSchema).min(1, 'Add at least one product.'),
+  discount: z.number().min(0).default(0),
+  cashSale: z.boolean().default(false),
   paidAmount: z.number().min(0).default(0),
-  accountId: z.string().uuid(), // Cash/Bank account the paid portion lands in
-});
+  accountId: z.string().uuid().optional(),
+}).refine((b) => b.cashSale || b.paidAmount <= 0 || !!b.accountId, { message: 'Choose which account the payment went into.' })
+  .refine((b) => !b.cashSale || !!b.accountId, { message: 'Choose which account the cash sale went into.' });
 
-// Shared logic for both create and update: validates stock, computes
-// totals, adjusts inventory, and posts the compound journal entry
-// (payment/AR split, Sales revenue, COGS/Inventory relief).
+async function heading(client, companyId, h) {
+  const { rows } = await client.query('select id from accounts where company_id=$1 and heading=$2 limit 1', [companyId, h]);
+  if (!rows[0]) { const e = new Error(`Missing required account for heading "${h}"`); e.status = 500; throw e; }
+  return rows[0].id;
+}
+
 async function createSaleWithinTx(client, companyId, userId, body) {
-  const prodRes = await client.query('select * from products where id=$1 and company_id=$2 for update', [body.productId, companyId]);
-  const product = prodRes.rows[0];
-  if (!product) { const e = new Error('Product not found'); e.status = 404; throw e; }
-  if (Number(product.stock) < body.qty) {
-    const e = new Error(`Insufficient stock: only ${product.stock} of "${product.name}" available.`);
-    e.status = 400; throw e;
-  }
   const custRes = await client.query('select * from customers where id=$1 and company_id=$2', [body.customerId, companyId]);
   const customer = custRes.rows[0];
   if (!customer) { const e = new Error('Customer not found'); e.status = 404; throw e; }
 
-  const total = body.price * body.qty;
-  const cost = Number(product.purchase_price) * body.qty;
-  const paidAmount = Math.min(Math.max(body.paidAmount, 0), total);
-  const creditAmount = total - paidAmount;
+  let subtotal = 0, totalCost = 0;
+  const lineData = [];
+  for (const line of body.lines) {
+    const prodRes = await client.query('select * from products where id=$1 and company_id=$2 for update', [line.productId, companyId]);
+    const product = prodRes.rows[0];
+    if (!product) { const e = new Error('Product not found'); e.status = 404; throw e; }
+    if (Number(product.stock) < line.qty) {
+      const e = new Error(`Insufficient stock: only ${product.stock} ${product.unit} of "${product.name}" available.`);
+      e.status = 400; throw e;
+    }
+    const lineTotal = line.price * line.qty;
+    const lineCost = Number(product.purchase_price) * line.qty;
+    subtotal += lineTotal;
+    totalCost += lineCost;
+    lineData.push({ product, qty: line.qty, price: line.price, unit: product.unit, lineTotal, lineCost });
+  }
 
-  await client.query('update products set stock = stock - $1 where id = $2', [body.qty, product.id]);
+  const discount = Math.min(Math.max(body.discount || 0, 0), subtotal);
+  const total = Math.round((subtotal - discount) * 100) / 100;
 
-  const lines = [];
-  if (paidAmount > 0) lines.push({ accountId: body.accountId, debit: paidAmount, credit: 0 });
-  if (creditAmount > 0) lines.push({ accountId: customer.account_id, debit: creditAmount, credit: 0 });
-  const salesAcct = await client.query("select id from accounts where company_id=$1 and heading='Sales' limit 1", [companyId]);
-  lines.push({ accountId: salesAcct.rows[0].id, debit: 0, credit: total });
-  if (cost > 0) {
-    const cogsAcct = await client.query("select id from accounts where company_id=$1 and heading='Cost of Goods Sold' limit 1", [companyId]);
-    const invAcct = await client.query("select id from accounts where company_id=$1 and heading='Inventory' limit 1", [companyId]);
-    lines.push({ accountId: cogsAcct.rows[0].id, debit: cost, credit: 0 });
-    lines.push({ accountId: invAcct.rows[0].id, debit: 0, credit: cost });
+  for (const l of lineData) {
+    await client.query('update products set stock = stock - $1 where id = $2', [l.qty, l.product.id]);
   }
 
   const date = await companyToday(client, companyId);
-  const memo = `Sale to ${customer.name} — ${body.qty} x ${product.name}${body.invoiceNumber ? ' — Invoice ' + body.invoiceNumber : ''}`;
-  const entry = await postJournal(client, { companyId, date, memo, source: 'Sale', reference: body.invoiceNumber, lines, createdBy: userId });
+  const salesAcct = await heading(client, companyId, 'Sales');
+  const invoiceRef = body.invoiceNumber ? ' — Invoice ' + body.invoiceNumber : '';
+
+  let paidAmount, creditAmount, invoiceJournalId;
+
+  if (body.cashSale) {
+    paidAmount = total; creditAmount = 0;
+    const lines = [{ accountId: body.accountId, debit: total, credit: 0 }, { accountId: salesAcct, debit: 0, credit: subtotal }];
+    if (discount > 0) lines.push({ accountId: await heading(client, companyId, 'Discount Allowed'), debit: discount, credit: 0 });
+    if (totalCost > 0) {
+      lines.push({ accountId: await heading(client, companyId, 'Cost of Goods Sold'), debit: totalCost, credit: 0 });
+      lines.push({ accountId: await heading(client, companyId, 'Inventory'), debit: 0, credit: totalCost });
+    }
+    const entry = await postJournal(client, { companyId, date, memo: `Cash sale to ${customer.name}${invoiceRef}`, source: 'Sale', reference: body.invoiceNumber, lines, createdBy: userId });
+    invoiceJournalId = entry?.id || null;
+  } else {
+    paidAmount = 0; creditAmount = total; // may be reduced just below if an upfront payment is recorded
+    const lines = [{ accountId: customer.account_id, debit: total, credit: 0 }, { accountId: salesAcct, debit: 0, credit: subtotal }];
+    if (discount > 0) lines.push({ accountId: await heading(client, companyId, 'Discount Allowed'), debit: discount, credit: 0 });
+    if (totalCost > 0) {
+      lines.push({ accountId: await heading(client, companyId, 'Cost of Goods Sold'), debit: totalCost, credit: 0 });
+      lines.push({ accountId: await heading(client, companyId, 'Inventory'), debit: 0, credit: totalCost });
+    }
+    const entry = await postJournal(client, { companyId, date, memo: `Sale to ${customer.name}${invoiceRef}`, source: 'Sale', reference: body.invoiceNumber, lines, createdBy: userId });
+    invoiceJournalId = entry?.id || null;
+  }
 
   const { rows } = await client.query(
     `insert into sales_invoices
-       (company_id, invoice_number, customer_id, product_id, qty, price, total, cost, paid_amount, credit_amount, payment_account_id, journal_entry_id, date, created_by)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) returning *`,
-    [companyId, body.invoiceNumber || null, body.customerId, body.productId, body.qty, body.price, total, cost, paidAmount, creditAmount, body.accountId, entry?.id || null, date, userId]
+       (company_id, invoice_number, customer_id, subtotal, discount, total, paid_amount, credit_amount, payment_account_id, journal_entry_id, date, cash_sale, created_by)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) returning *`,
+    [companyId, body.invoiceNumber || null, body.customerId, subtotal, discount, total, paidAmount, creditAmount, body.accountId || null, invoiceJournalId, date, body.cashSale, userId]
   );
-  return rows[0];
+  const sale = rows[0];
+
+  for (const l of lineData) {
+    await client.query(
+      `insert into sales_invoice_lines (sales_invoice_id, product_id, unit, qty, price, cost, line_total) values ($1,$2,$3,$4,$5,$6,$7)`,
+      [sale.id, l.product.id, l.unit, l.qty, l.price, l.lineCost, l.lineTotal]
+    );
+  }
+
+  // An upfront payment on a credit sale is its own, separately visible
+  // transaction against this invoice — not folded into the invoice's own
+  // journal entry — so the ledger shows the real invoice and the real
+  // payment against it, not a pre-netted figure.
+  if (!body.cashSale && body.paidAmount > 0) {
+    const applied = Math.min(body.paidAmount, total);
+    await createPaymentWithinTx(client, companyId, userId, {
+      type: 'customer_receipt', partyId: body.customerId, amount: applied, accountId: body.accountId,
+      date, invoiceNumber: body.invoiceNumber, salesInvoiceId: sale.id,
+    });
+    sale.paid_amount = applied;
+    sale.credit_amount = Math.round((total - applied) * 100) / 100;
+    await client.query('update sales_invoices set paid_amount=$1, credit_amount=$2 where id=$3', [sale.paid_amount, sale.credit_amount, sale.id]);
+  }
+
+  sale.lines = lineData.map((l) => ({ product_name: l.product.name, unit: l.unit, qty: l.qty, price: l.price, line_total: l.lineTotal }));
+  return sale;
 }
 
 async function reverseSaleWithinTx(client, companyId, saleId) {
   const { rows } = await client.query('select * from sales_invoices where id=$1 and company_id=$2', [saleId, companyId]);
   const sale = rows[0];
   if (!sale) return null;
-  await client.query('update products set stock = stock + $1 where id = $2', [sale.qty, sale.product_id]);
+  const { rows: lines } = await client.query('select * from sales_invoice_lines where sales_invoice_id=$1', [saleId]);
+  for (const l of lines) {
+    await client.query('update products set stock = stock + $1 where id = $2', [l.qty, l.product_id]);
+  }
+  await reverseLinkedPaymentsWithinTx(client, companyId, { salesInvoiceId: saleId });
   await reverseJournalEntry(client, sale.journal_entry_id);
-  await client.query('delete from sales_invoices where id = $1', [saleId]);
+  await client.query('delete from sales_invoices where id = $1', [saleId]); // cascades to sales_invoice_lines
   return sale;
 }
 
@@ -148,9 +223,6 @@ router.post('/', requireRole('manager'), async (req, res, next) => {
   }
 });
 
-// PUT /:id — fully reverses the old sale (stock + journal) then re-creates it
-// with the new values, inside one transaction, so it's never possible to end
-// up in a half-updated state.
 router.put('/:id', requireRole('manager'), async (req, res, next) => {
   try {
     const body = saleSchema.parse(req.body);
@@ -158,7 +230,7 @@ router.put('/:id', requireRole('manager'), async (req, res, next) => {
       const old = await reverseSaleWithinTx(client, req.user.company_id, req.params.id);
       if (!old) { const e = new Error('Not found'); e.status = 404; throw e; }
       const s = await createSaleWithinTx(client, req.user.company_id, req.user.id, body);
-      await audit(client, { companyId: req.user.company_id, userId: req.user.id, action: 'update', entity: 'sales_invoice', entityId: s.id, details: { replaced: old.id, before: { invoiceNumber: old.invoice_number, total: old.total, qty: old.qty }, after: { invoiceNumber: s.invoice_number, total: s.total, qty: s.qty } } });
+      await audit(client, { companyId: req.user.company_id, userId: req.user.id, action: 'update', entity: 'sales_invoice', entityId: s.id, details: { replaced: old.id, before: { invoiceNumber: old.invoice_number, total: old.total }, after: { invoiceNumber: s.invoice_number, total: s.total } } });
       return s;
     });
     res.json(sale);
@@ -172,12 +244,15 @@ router.delete('/:id', requireRole('manager'), async (req, res, next) => {
   try {
     const sale = await withTransaction(async (client) => {
       const old = await reverseSaleWithinTx(client, req.user.company_id, req.params.id);
-      if (old) await audit(client, { companyId: req.user.company_id, userId: req.user.id, action: 'delete', entity: 'sales_invoice', entityId: old.id, details: { invoiceNumber: old.invoice_number, total: old.total, qty: old.qty } });
+      if (old) await audit(client, { companyId: req.user.company_id, userId: req.user.id, action: 'delete', entity: 'sales_invoice', entityId: old.id, details: { invoiceNumber: old.invoice_number, total: old.total } });
       return old;
     });
     if (!sale) return res.status(404).json({ error: 'Not found' });
     res.status(204).end();
-  } catch (err) { next(err); }
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
 });
 
 module.exports = router;

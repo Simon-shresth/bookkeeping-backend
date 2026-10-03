@@ -110,28 +110,46 @@ async function getHeadingBalance(companyId, heading) {
 // an opening balance row (0 unless/until period-opening balances are
 // introduced — the column exists so that feature can be added later
 // without changing the shape of this response).
-async function getAccountLedger(companyId, accountId) {
+async function getAccountLedger(companyId, accountId, { from, till } = {}) {
   const accRes = await pool.query('select id, name, heading, category from accounts where id = $1 and company_id = $2', [accountId, companyId]);
   const account = accRes.rows[0];
   if (!account) return null;
+  const debitNormal = isDebitNormal(account.category);
+
+  // Opening balance: the net effect of everything strictly before `from`,
+  // computed in SQL rather than by summing JS rows we'd otherwise discard.
+  let openingBalance = 0;
+  if (from) {
+    const { rows } = await pool.query(
+      `select coalesce(sum(jl.debit),0) as debit, coalesce(sum(jl.credit),0) as credit
+       from journal_lines jl join journal_entries je on je.id = jl.journal_entry_id
+       where jl.account_id = $1 and je.company_id = $2 and je.date < $3`,
+      [accountId, companyId, from]
+    );
+    openingBalance = debitNormal ? Number(rows[0].debit) - Number(rows[0].credit) : Number(rows[0].credit) - Number(rows[0].debit);
+  }
+
+  const params = [accountId, companyId];
+  let where = 'jl.account_id = $1 and je.company_id = $2';
+  if (from) { params.push(from); where += ` and je.date >= $${params.length}`; }
+  if (till) { params.push(till); where += ` and je.date <= $${params.length}`; }
 
   const { rows } = await pool.query(
     `select je.date, je.memo, je.source, je.reference, jl.debit, jl.credit
      from journal_lines jl
      join journal_entries je on je.id = jl.journal_entry_id
-     where jl.account_id = $1 and je.company_id = $2
+     where ${where}
      order by je.date asc, je.created_at asc`,
-    [accountId, companyId]
+    params
   );
 
-  const debitNormal = isDebitNormal(account.category);
-  let running = 0;
+  let running = openingBalance;
   const entries = rows.map((r) => {
     running += debitNormal ? Number(r.debit) - Number(r.credit) : Number(r.credit) - Number(r.debit);
     return { ...r, runningBalance: running };
   });
 
-  return { account, openingBalance: 0, entries, closingBalance: running };
+  return { account, openingBalance, entries, closingBalance: running };
 }
 
 // Chart of Accounts for display: every heading, with its accounts and
@@ -143,7 +161,7 @@ const DEFAULT_HEADINGS = {
   Liabilities: ['Accounts Payable', 'Loans', 'Taxes Payable'],
   Equity: ["Owner's Capital", "Owner's Drawings", 'Retained Earnings'],
   Income: ['Sales', 'Service Income', 'Other Income'],
-  Expenses: ['Rent', 'Salary', 'Electricity', 'Freight', 'Office Expenses', 'Cost of Goods Sold'],
+  Expenses: ['Rent', 'Salary', 'Electricity', 'Freight', 'Office Expenses', 'Discount Allowed', 'Cost of Goods Sold'],
 };
 
 async function getChartOfAccounts(companyId) {

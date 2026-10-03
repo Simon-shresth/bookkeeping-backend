@@ -65,15 +65,19 @@ router.get('/ar-aging', async (req, res, next) => {
   try {
     const companyId = req.user.company_id;
     const { rows: invoices } = await pool.query(
-      `select s.id, s.date::text as date, s.invoice_number, c.id as party_id, c.name as customer, s.credit_amount
+      `select s.id, s.date::text as date, s.invoice_number, c.id as party_id, c.name as customer, s.total, s.credit_amount
        from sales_invoices s join customers c on c.id = s.customer_id
        where s.company_id=$1 and s.credit_amount > 0
        order by s.date, s.created_at`,
       [companyId]
     );
+    // Only payments NOT already linked to a specific invoice go into the
+    // FIFO pool below — a linked payment (the upfront amount paid at the
+    // time of invoicing) is already netted into that invoice's own
+    // credit_amount, so including it here would subtract it twice.
     const { rows: paid } = await pool.query(
       `select customer_id, sum(amount) as total from payments
-       where company_id=$1 and type='customer_receipt' group by customer_id`,
+       where company_id=$1 and type='customer_receipt' and sales_invoice_id is null group by customer_id`,
       [companyId]
     );
     const paidByParty = Object.fromEntries(paid.map((p) => [p.customer_id, Number(p.total)]));
@@ -87,7 +91,7 @@ router.get('/ap-aging', async (req, res, next) => {
   try {
     const companyId = req.user.company_id;
     const { rows: invoices } = await pool.query(
-      `select p.id, p.date::text as date, p.invoice_number, p.pragyapan_number, s.id as party_id, s.name as supplier, p.credit_amount
+      `select p.id, p.date::text as date, p.invoice_number, p.pragyapan_number, s.id as party_id, s.name as supplier, p.total, p.credit_amount
        from purchase_invoices p join suppliers s on s.id = p.supplier_id
        where p.company_id=$1 and p.credit_amount > 0
        order by p.date, p.created_at`,
@@ -95,7 +99,7 @@ router.get('/ap-aging', async (req, res, next) => {
     );
     const { rows: paid } = await pool.query(
       `select supplier_id, sum(amount) as total from payments
-       where company_id=$1 and type='supplier_payment' group by supplier_id`,
+       where company_id=$1 and type='supplier_payment' and purchase_invoice_id is null group by supplier_id`,
       [companyId]
     );
     const paidByParty = Object.fromEntries(paid.map((p) => [p.supplier_id, Number(p.total)]));
