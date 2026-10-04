@@ -167,6 +167,23 @@ users (`/api/users/*`) requires `admin`.
   not on every keystroke (frontend change, mentioned here since it affects
   how you'll use these endpoints during testing).
 
+## Multi-unit inventory conversion (Meters <-> Yards, etc.)
+
+- Any product can have an optional **alternate unit** (e.g. base = MTR,
+  alternate = YRD) with a conversion factor — the standard 0.9144 / 1.09361
+  is suggested automatically for exactly that pair, but every product can
+  set its own custom factor.
+- **Stock is always tracked in the base unit.** Selling in the alternate
+  unit converts automatically before touching stock or computing COGS —
+  see `src/services/uom.js` (`resolveUnitFactor`), covered by
+  `test/uom.test.js`.
+- Each sale line snapshots the unit it was actually sold in, the conversion
+  factor used, and the resulting base-unit quantity (`sales_invoice_lines.base_qty`)
+  — so a later change to a product's factor never rewrites history, and
+  reversing (editing/deleting) a sale restores the *exact* amount of stock
+  that was actually deducted.
+- This needed `db/migrations/005_multi_unit_conversion.sql` — run `npm run migrate`.
+
 ## What's next (later phases)
 
 - **Phase 2**: React frontend, calling this API, replacing the current

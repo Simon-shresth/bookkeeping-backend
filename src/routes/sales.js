@@ -7,6 +7,7 @@ const { createPaymentWithinTx, reverseLinkedPaymentsWithinTx } = require('../ser
 const { companyToday } = require('../services/dates');
 const { audit } = require('../services/audit');
 const { buildSalesInvoicePdf } = require('../services/invoicePdf');
+const { resolveUnitFactor } = require('../services/uom');
 
 const router = express.Router();
 
@@ -85,7 +86,7 @@ router.get('/:id/pdf', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-const lineSchema = z.object({ productId: z.string().uuid(), qty: z.number().positive(), price: z.number().min(0) });
+const lineSchema = z.object({ productId: z.string().uuid(), qty: z.number().positive(), price: z.number().min(0), unit: z.string().min(1) });
 const saleSchema = z.object({
   invoiceNumber: z.string().optional(),
   customerId: z.string().uuid(),
@@ -122,22 +123,32 @@ async function createSaleWithinTx(client, companyId, userId, body) {
     const prodRes = await client.query('select * from products where id=$1 and company_id=$2 for update', [line.productId, companyId]);
     const product = prodRes.rows[0];
     if (!product) { const e = new Error('Product not found'); e.status = 404; throw e; }
-    if (Number(product.stock) < line.qty) {
-      const e = new Error(`Insufficient stock: only ${product.stock} ${product.unit} of "${product.name}" available.`);
+
+    // Stock is always tracked in the product's BASE unit — convert whatever
+    // unit this line was sold in before touching stock or costing it.
+    const conversionFactor = resolveUnitFactor(product, line.unit);
+    if (conversionFactor === null) {
+      const e = new Error(`"${line.unit}" is not a valid unit for "${product.name}" (base: ${product.unit}${product.alt_unit ? `, alternate: ${product.alt_unit}` : ''}).`);
+      e.status = 400; throw e;
+    }
+    const baseQty = Math.round(line.qty * conversionFactor * 10000) / 10000;
+
+    if (Number(product.stock) < baseQty) {
+      const e = new Error(`Insufficient stock: only ${product.stock} ${product.unit} of "${product.name}" available (you're selling ${line.qty} ${line.unit} = ${baseQty} ${product.unit}).`);
       e.status = 400; throw e;
     }
     const lineTotal = line.price * line.qty;
-    const lineCost = Number(product.purchase_price) * line.qty;
+    const lineCost = Number(product.purchase_price) * baseQty; // cost normalized to base UOM
     subtotal += lineTotal;
     totalCost += lineCost;
-    lineData.push({ product, qty: line.qty, price: line.price, unit: product.unit, lineTotal, lineCost });
+    lineData.push({ product, qty: line.qty, price: line.price, unit: line.unit, baseQty, conversionFactor, lineTotal, lineCost });
   }
 
   const discount = Math.min(Math.max(body.discount || 0, 0), subtotal);
   const total = Math.round((subtotal - discount) * 100) / 100;
 
   for (const l of lineData) {
-    await client.query('update products set stock = stock - $1 where id = $2', [l.qty, l.product.id]);
+    await client.query('update products set stock = stock - $1 where id = $2', [l.baseQty, l.product.id]);
   }
 
   const date = await companyToday(client, companyId);
@@ -178,8 +189,9 @@ async function createSaleWithinTx(client, companyId, userId, body) {
 
   for (const l of lineData) {
     await client.query(
-      `insert into sales_invoice_lines (sales_invoice_id, product_id, unit, qty, price, cost, line_total) values ($1,$2,$3,$4,$5,$6,$7)`,
-      [sale.id, l.product.id, l.unit, l.qty, l.price, l.lineCost, l.lineTotal]
+      `insert into sales_invoice_lines (sales_invoice_id, product_id, unit, qty, price, cost, line_total, base_qty, conversion_factor)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [sale.id, l.product.id, l.unit, l.qty, l.price, l.lineCost, l.lineTotal, l.baseQty, l.conversionFactor]
     );
   }
 
@@ -198,7 +210,7 @@ async function createSaleWithinTx(client, companyId, userId, body) {
     await client.query('update sales_invoices set paid_amount=$1, credit_amount=$2 where id=$3', [sale.paid_amount, sale.credit_amount, sale.id]);
   }
 
-  sale.lines = lineData.map((l) => ({ product_name: l.product.name, unit: l.unit, qty: l.qty, price: l.price, line_total: l.lineTotal }));
+  sale.lines = lineData.map((l) => ({ product_name: l.product.name, unit: l.unit, qty: l.qty, price: l.price, line_total: l.lineTotal, base_qty: l.baseQty }));
   return sale;
 }
 
@@ -208,7 +220,11 @@ async function reverseSaleWithinTx(client, companyId, saleId) {
   if (!sale) return null;
   const { rows: lines } = await client.query('select * from sales_invoice_lines where sales_invoice_id=$1', [saleId]);
   for (const l of lines) {
-    await client.query('update products set stock = stock + $1 where id = $2', [l.qty, l.product_id]);
+    // Restore using base_qty (the actual amount deducted at sale time), NOT
+    // qty (the quantity in whatever unit it was sold in) — those differ
+    // whenever the sale used the alternate unit, and using qty here would
+    // silently corrupt the stock count.
+    await client.query('update products set stock = stock + $1 where id = $2', [l.base_qty, l.product_id]);
   }
   await reverseLinkedPaymentsWithinTx(client, companyId, { salesInvoiceId: saleId });
   await reverseJournalEntry(client, sale.journal_entry_id);

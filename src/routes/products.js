@@ -19,15 +19,18 @@ const schema = z.object({
   stock: z.number().default(0),
   minStock: z.number().min(0).default(0),
   unit: z.string().min(1).default('pcs'),
-});
+  altUnit: z.string().min(1).optional(),
+  altUnitFactor: z.number().positive().optional(),
+}).refine((b) => !b.altUnit || b.altUnit !== b.unit, { message: 'The alternate unit must be different from the base unit.' })
+  .refine((b) => !b.altUnit || b.altUnitFactor, { message: 'Enter a conversion factor for the alternate unit.' });
 
 router.post('/', requireRole('manager'), async (req, res, next) => {
   try {
     const b = schema.parse(req.body);
     const { rows } = await pool.query(
-      `insert into products (company_id, name, purchase_price, sell_price, stock, min_stock, unit)
-       values ($1,$2,$3,$4,$5,$6,$7) returning *`,
-      [req.user.company_id, b.name, b.purchasePrice, b.sellPrice, b.stock, b.minStock, b.unit]
+      `insert into products (company_id, name, purchase_price, sell_price, stock, min_stock, unit, alt_unit, alt_unit_factor)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9) returning *`,
+      [req.user.company_id, b.name, b.purchasePrice, b.sellPrice, b.stock, b.minStock, b.unit, b.altUnit || null, b.altUnitFactor || null]
     );
     res.status(201).json(rows[0]);
   } catch (err) {
@@ -40,9 +43,9 @@ router.put('/:id', requireRole('manager'), async (req, res, next) => {
   try {
     const b = schema.parse(req.body);
     const { rows } = await pool.query(
-      `update products set name=$1, purchase_price=$2, sell_price=$3, stock=$4, min_stock=$5, unit=$6
-       where id=$7 and company_id=$8 returning *`,
-      [b.name, b.purchasePrice, b.sellPrice, b.stock, b.minStock, b.unit, req.params.id, req.user.company_id]
+      `update products set name=$1, purchase_price=$2, sell_price=$3, stock=$4, min_stock=$5, unit=$6, alt_unit=$7, alt_unit_factor=$8
+       where id=$9 and company_id=$10 returning *`,
+      [b.name, b.purchasePrice, b.sellPrice, b.stock, b.minStock, b.unit, b.altUnit || null, b.altUnitFactor || null, req.params.id, req.user.company_id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Not found' });
     res.json(rows[0]);

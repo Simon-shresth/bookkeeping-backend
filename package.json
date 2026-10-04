@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "test": "node test/auth.test.js",
+    "test": "node test/auth.test.js && node test/uom.test.js",
     "migrate": "node scripts/migrate.js",
     "bootstrap-company": "node scripts/bootstrap-company.js",
     "backup": "bash scripts/backup.sh"
