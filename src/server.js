@@ -24,6 +24,7 @@ const paymentsRoutes = require('./routes/payments');
 const reconciliationRoutes = require('./routes/reconciliation');
 const auditRoutes = require('./routes/audit');
 const { pool } = require('./db');
+const payrollRoutes = require('./routes/payroll');//payroll addtn
 
 const app = express();
 
@@ -73,6 +74,7 @@ app.use('/api/users', usersRoutes);
 app.use('/api/payments', paymentsRoutes);
 app.use('/api/reconciliation', reconciliationRoutes);
 app.use('/api/audit', auditRoutes);
+app.use('/api/payroll', payrollRoutes);//payroll addtn
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
