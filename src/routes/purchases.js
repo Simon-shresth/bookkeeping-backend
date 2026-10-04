@@ -68,9 +68,17 @@ const purchaseSchema = z.object({
   accountId: z.string().uuid().optional(),
 }).refine((b) => b.paidAmount <= 0 || !!b.accountId, { message: 'Choose which account the payment went from.' });
 
+// Looks up the ORIGINAL system account for a heading (Sales, Cost of Goods
+// Sold, Inventory, Discount Allowed) — never a custom account someone added
+// under the same heading later. Multiple accounts can share a heading (e.g.
+// several Bank accounts), so without the is_system filter this could pick
+// any of them, including one that has nothing to do with automatic postings.
 async function heading(client, companyId, h) {
-  const { rows } = await client.query('select id from accounts where company_id=$1 and heading=$2 limit 1', [companyId, h]);
-  if (!rows[0]) { const e = new Error(`Missing required account for heading "${h}"`); e.status = 500; throw e; }
+  const { rows } = await client.query(
+    'select id from accounts where company_id=$1 and heading=$2 and is_system=true order by created_at asc limit 1',
+    [companyId, h]
+  );
+  if (!rows[0]) { const e = new Error(`Missing required system account for heading "${h}"`); e.status = 500; throw e; }
   return rows[0].id;
 }
 
