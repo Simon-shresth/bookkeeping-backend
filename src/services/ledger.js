@@ -164,21 +164,51 @@ const DEFAULT_HEADINGS = {
   Expenses: ['Rent', 'Salary', 'Electricity', 'Freight', 'Office Expenses', 'Discount Allowed', 'Cost of Goods Sold'],
 };
 
+// Fetch net balances for ALL accounts of a company in one query.
+// Returns a Map<accountId, balance> using each account's debit-normal rule.
+async function getAllBalances(companyId) {
+  const { rows } = await pool.query(
+    `select a.id, a.category,
+            coalesce(sum(jl.debit), 0) as debit,
+            coalesce(sum(jl.credit), 0) as credit
+     from accounts a
+     left join journal_lines jl on jl.account_id = a.id
+     left join journal_entries je on je.id = jl.journal_entry_id and je.company_id = a.company_id
+     where a.company_id = $1
+     group by a.id, a.category`,
+    [companyId]
+  );
+  const map = new Map();
+  for (const r of rows) {
+    const bal = isDebitNormal(r.category)
+      ? Number(r.debit) - Number(r.credit)
+      : Number(r.credit) - Number(r.debit);
+    map.set(r.id, bal);
+  }
+  return map;
+}
+
 async function getChartOfAccounts(companyId) {
-  const { rows: accounts } = await pool.query('select id, name, heading, category, is_system from accounts where company_id = $1', [companyId]);
+  const { rows: accounts } = await pool.query(
+    'select id, name, heading, category, is_system from accounts where company_id = $1',
+    [companyId]
+  );
+  const balances = await getAllBalances(companyId);
   const result = [];
   for (const [category, headings] of Object.entries(DEFAULT_HEADINGS)) {
     const headingRows = [];
     for (const heading of headings) {
       if (heading === 'Accounts Receivable' || heading === 'Accounts Payable') {
-        const bal = await getHeadingBalance(companyId, heading);
-        const count = accounts.filter((a) => a.heading === heading).length;
-        headingRows.push({ heading, collapsed: true, balance: bal, subAccountCount: count });
+        const accs = accounts.filter((a) => a.heading === heading);
+        const bal = accs.reduce((s, a) => s + (balances.get(a.id) || 0), 0);
+        headingRows.push({ heading, collapsed: true, balance: bal, subAccountCount: accs.length });
       } else {
         const accs = accounts.filter((a) => a.heading === heading);
-        const withBalances = [];
-        for (const a of accs) withBalances.push({ id: a.id, name: a.name, is_system: a.is_system, balance: await getAccountBalance(companyId, a.id) });
-        headingRows.push({ heading, collapsed: false, accounts: withBalances });
+        headingRows.push({
+          heading,
+          collapsed: false,
+          accounts: accs.map((a) => ({ id: a.id, name: a.name, is_system: a.is_system, balance: balances.get(a.id) || 0 })),
+        });
       }
     }
     result.push({ category, headings: headingRows });
@@ -187,34 +217,48 @@ async function getChartOfAccounts(companyId) {
 }
 
 async function getTotals(companyId) {
-  const revenueAccounts = await pool.query("select id from accounts where company_id=$1 and category='Income'", [companyId]);
-  let revenue = 0;
-  for (const r of revenueAccounts.rows) revenue += await getAccountBalance(companyId, r.id);
+  const { rows } = await pool.query(
+    `select a.id, a.category, a.heading,
+            coalesce(sum(jl.debit), 0) as debit,
+            coalesce(sum(jl.credit), 0) as credit
+     from accounts a
+     left join journal_lines jl on jl.account_id = a.id
+     left join journal_entries je on je.id = jl.journal_entry_id and je.company_id = a.company_id
+     where a.company_id = $1 and a.category in ('Income', 'Expenses', 'Assets', 'Liabilities')
+     group by a.id, a.category, a.heading`,
+    [companyId]
+  );
 
-  const cogs = await getHeadingBalance(companyId, 'Cost of Goods Sold');
+  let revenue = 0, cogs = 0, expenseTotal = 0, ar = 0, ap = 0;
+  for (const r of rows) {
+    const bal = isDebitNormal(r.category)
+      ? Number(r.debit) - Number(r.credit)
+      : Number(r.credit) - Number(r.debit);
+    if (r.category === 'Income') revenue += bal;
+    else if (r.category === 'Expenses' && r.heading === 'Cost of Goods Sold') cogs += bal;
+    else if (r.category === 'Expenses') expenseTotal += bal;
+    else if (r.category === 'Assets' && r.heading === 'Accounts Receivable') ar += bal;
+    else if (r.category === 'Liabilities' && r.heading === 'Accounts Payable') ap += bal;
+  }
 
-  const expenseAccounts = await pool.query("select id from accounts where company_id=$1 and category='Expenses' and heading <> 'Cost of Goods Sold'", [companyId]);
-  let expenseTotal = 0;
-  for (const r of expenseAccounts.rows) expenseTotal += await getAccountBalance(companyId, r.id);
-
-  const ar = await getHeadingBalance(companyId, 'Accounts Receivable');
-  const ap = await getHeadingBalance(companyId, 'Accounts Payable');
-  const profit = revenue - cogs - expenseTotal;
-  return { revenue, cogs, expenseTotal, ar, ap, profit };
+  return { revenue, cogs, expenseTotal, ar, ap, profit: revenue - cogs - expenseTotal };
 }
 
 async function getBalanceSheet(companyId) {
-  const { rows: accounts } = await pool.query('select id, name, category from accounts where company_id=$1', [companyId]);
-  const byCategory = async (cat) => {
-    const list = [];
-    for (const a of accounts.filter((x) => x.category === cat)) {
-      list.push({ name: a.name, balance: await getAccountBalance(companyId, a.id) });
-    }
-    return list;
-  };
-  const assets = await byCategory('Assets');
-  const liabilities = await byCategory('Liabilities');
-  const equityAccounts = await byCategory('Equity');
+  const balances = await getAllBalances(companyId);
+  const { rows: accounts } = await pool.query(
+    'select id, name, category from accounts where company_id=$1',
+    [companyId]
+  );
+
+  const byCategory = (cat) =>
+    accounts
+      .filter((a) => a.category === cat)
+      .map((a) => ({ name: a.name, balance: balances.get(a.id) || 0 }));
+
+  const assets = byCategory('Assets');
+  const liabilities = byCategory('Liabilities');
+  const equityAccounts = byCategory('Equity');
   const t = await getTotals(companyId);
   const currentEarnings = t.revenue - t.cogs - t.expenseTotal;
   const totalAssets = assets.reduce((s, a) => s + a.balance, 0);
@@ -230,6 +274,7 @@ module.exports = {
   reverseJournalEntry,
   getAccountBalance,
   getHeadingBalance,
+  getAllBalances,
   getAccountLedger,
   getChartOfAccounts,
   getTotals,
