@@ -102,6 +102,20 @@ app.use((err, req, res, next) => {
 const port = process.env.PORT || 4000;
 const server = app.listen(port, () => console.log(`Bookkeeping API listening on port ${port}`));
 
+// On Render's free plan the service spins down after ~15 min of inactivity,
+// causing a 30-second cold start on the next real request. Self-ping every
+// 14 minutes keeps it warm. Only runs in production (Render sets NODE_ENV).
+if (process.env.NODE_ENV === 'production' && process.env.RENDER_EXTERNAL_URL) {
+  const PING_INTERVAL_MS = 14 * 60 * 1000;
+  setInterval(async () => {
+    try {
+      await fetch(`${process.env.RENDER_EXTERNAL_URL}/health`);
+    } catch {
+      // ignore — if this fails it just means a cold start will happen anyway
+    }
+  }, PING_INTERVAL_MS);
+}
+
 // Render (and most hosts) send SIGTERM on deploy/restart. Stop taking new
 // requests, let in-flight ones (including open DB transactions) finish, then
 // close the pool — so a deploy never cuts a ledger write in half.

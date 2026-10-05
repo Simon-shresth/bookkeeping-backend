@@ -108,22 +108,54 @@ async function requireAuth(req, res, next) {
     const payload = token ? await verifyJwt(token) : null;
     if (!payload) return res.status(401).json({ error: 'Missing or invalid bearer token' });
 
-    const { rows } = await db().query(
-      'select id, company_id, email, role, is_active from users where id = $1',
-      [payload.sub]
-    );
-    const user = rows[0];
+    let user = getCachedUser(payload.sub);
+    if (!user) {
+      const { rows } = await db().query(
+        'select id, company_id, email, role, is_active from users where id = $1',
+        [payload.sub]
+      );
+      user = rows[0];
+      if (user) setCachedUser(payload.sub, user);
+    }
+
     if (!user) return res.status(403).json({ error: 'No profile found for this account. Ask an admin to add you to a company.' });
     if (!user.is_active) return res.status(403).json({ error: 'This account has been deactivated.' });
 
-    req.user = user; // { id, company_id, email, role }
+    req.user = user;
     next();
   } catch (err) {
     next(err);
   }
 }
 
-// Role hierarchy: admin > accountant > manager > viewer.
+// Short-lived in-memory cache for user rows. Each entry lives for 60 seconds
+// so the DB isn't hit on every API call (a page load fires 10+ requests).
+// TTL is short enough that role/deactivation changes propagate quickly.
+const USER_CACHE_TTL_MS = 60 * 1000;
+const userCache = new Map(); // sub -> { user, expiresAt }
+
+function getCachedUser(sub) {
+  const entry = userCache.get(sub);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { userCache.delete(sub); return null; }
+  return entry.user;
+}
+
+function setCachedUser(sub, user) {
+  userCache.set(sub, { user, expiresAt: Date.now() + USER_CACHE_TTL_MS });
+  // Prevent unbounded growth — evict oldest entries if cache exceeds 500 users.
+  if (userCache.size > 500) {
+    const firstKey = userCache.keys().next().value;
+    userCache.delete(firstKey);
+  }
+}
+
+// Call this when a user's role or active status changes so the next request
+// re-reads from the DB immediately rather than waiting for TTL expiry.
+function invalidateUserCache(userId) {
+  userCache.delete(userId);
+}
+
 // requireRole('accountant') allows accountant and admin, blocks manager/viewer.
 const ROLE_RANK = { viewer: 0, manager: 1, accountant: 2, admin: 3 };
 
@@ -137,4 +169,4 @@ function requireRole(minRole) {
   };
 }
 
-module.exports = { requireAuth, requireSupabaseAuth, requireRole, ROLE_RANK, verifyJwt };
+module.exports = { requireAuth, requireSupabaseAuth, requireRole, ROLE_RANK, verifyJwt, invalidateUserCache };

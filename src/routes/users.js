@@ -1,7 +1,7 @@
 const express = require('express');
 const { z } = require('zod');
 const { pool } = require('../db');
-const { requireRole } = require('../auth');
+const { requireRole, invalidateUserCache } = require('../auth');
 const { supabaseAdmin } = require('../lib/supabaseAdmin');
 const { audit } = require('../services/audit');
 
@@ -77,6 +77,7 @@ router.patch('/:id', requireRole('admin'), async (req, res, next) => {
       [role ?? null, isActive ?? null, req.params.id, req.user.company_id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Not found' });
+    invalidateUserCache(rows[0].id);
     await audit(pool, { companyId: req.user.company_id, userId: req.user.id, action: 'update', entity: 'user', entityId: rows[0].id, details: { email: rows[0].email, role: rows[0].role, isActive: rows[0].is_active } });
     res.json(rows[0]);
   } catch (err) { next(err); }
