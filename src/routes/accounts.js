@@ -53,4 +53,32 @@ router.post('/', requireRole('accountant'), async (req, res, next) => {
   }
 });
 
+// DELETE /api/accounts/:id — remove a user-created account only if it has no
+// transactions and is not a system account.
+router.delete('/:id', requireRole('accountant'), async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      'select is_system, name from accounts where id=$1 and company_id=$2',
+      [req.params.id, req.user.company_id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Not found' });
+    if (rows[0].is_system) return res.status(400).json({ error: 'System accounts cannot be deleted.' });
+
+    const { rows: used } = await pool.query(
+      'select 1 from journal_lines where account_id=$1 limit 1',
+      [req.params.id]
+    );
+    if (used[0]) return res.status(400).json({ error: 'This account has transactions and cannot be deleted. Zero out the balance first or use it in a reversing journal entry.' });
+
+    // Also block if it is referenced by customers/suppliers/products
+    const { rows: refCustomer } = await pool.query('select 1 from customers where account_id=$1 limit 1', [req.params.id]);
+    if (refCustomer[0]) return res.status(400).json({ error: 'This account belongs to a customer and cannot be deleted directly. Delete the customer instead.' });
+    const { rows: refSupplier } = await pool.query('select 1 from suppliers where account_id=$1 limit 1', [req.params.id]);
+    if (refSupplier[0]) return res.status(400).json({ error: 'This account belongs to a supplier and cannot be deleted directly. Delete the supplier instead.' });
+
+    await pool.query('delete from accounts where id=$1 and company_id=$2', [req.params.id, req.user.company_id]);
+    res.status(204).end();
+  } catch (err) { next(err); }
+});
+
 module.exports = router;

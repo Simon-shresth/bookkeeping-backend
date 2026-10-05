@@ -28,7 +28,7 @@ async function ensureSubAccount(client, companyId, name, heading, category) {
 // credits). Lines with a zero amount are dropped. Returns null if
 // nothing meaningful was posted (e.g. a fully-paid-on-both-sides
 // no-op), otherwise the new journal_entries row.
-async function postJournal(client, { companyId, date, memo, source, reference, lines, createdBy }) {
+async function postJournal(client, { companyId, date, memo, remark, source, reference, lines, createdBy }) {
   const clean = lines.filter((l) => Number(l.debit || 0) > 0.004 || Number(l.credit || 0) > 0.004);
   if (!clean.length) return null;
 
@@ -41,9 +41,9 @@ async function postJournal(client, { companyId, date, memo, source, reference, l
   }
 
   const entryRes = await client.query(
-    `insert into journal_entries (company_id, date, memo, source, reference, created_by)
-     values ($1,$2,$3,$4,$5,$6) returning *`,
-    [companyId, date, memo, source, reference || null, createdBy || null]
+    `insert into journal_entries (company_id, date, memo, remark, source, reference, created_by)
+     values ($1,$2,$3,$4,$5,$6,$7) returning *`,
+    [companyId, date, memo, remark || null, source, reference || null, createdBy || null]
   );
   const entry = entryRes.rows[0];
 
@@ -165,7 +165,7 @@ const DEFAULT_HEADINGS = {
 };
 
 async function getChartOfAccounts(companyId) {
-  const { rows: accounts } = await pool.query('select id, name, heading, category from accounts where company_id = $1', [companyId]);
+  const { rows: accounts } = await pool.query('select id, name, heading, category, is_system from accounts where company_id = $1', [companyId]);
   const result = [];
   for (const [category, headings] of Object.entries(DEFAULT_HEADINGS)) {
     const headingRows = [];
@@ -177,7 +177,7 @@ async function getChartOfAccounts(companyId) {
       } else {
         const accs = accounts.filter((a) => a.heading === heading);
         const withBalances = [];
-        for (const a of accs) withBalances.push({ id: a.id, name: a.name, balance: await getAccountBalance(companyId, a.id) });
+        for (const a of accs) withBalances.push({ id: a.id, name: a.name, is_system: a.is_system, balance: await getAccountBalance(companyId, a.id) });
         headingRows.push({ heading, collapsed: false, accounts: withBalances });
       }
     }

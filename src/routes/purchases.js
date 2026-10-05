@@ -21,19 +21,27 @@ async function attachLines(invoices) {
   return invoices.map((i) => ({ ...i, lines: byInvoice[i.id] || [] }));
 }
 
-// GET /api/purchases?q=search
+// GET /api/purchases?q=search&from=YYYY-MM-DD&till=YYYY-MM-DD&type=cash|credit|all
 router.get('/', async (req, res, next) => {
   try {
     const q = (req.query.q || '').trim();
+    const from = (req.query.from || '').trim();
+    const till = (req.query.till || '').trim();
+    const type = (req.query.type || '').trim(); // 'cash' (fully paid) | 'credit' | ''
     const params = [req.user.company_id];
     let where = 'where pu.company_id = $1';
     if (q) {
       params.push(`%${q}%`);
-      where += ` and (pu.invoice_number ilike $2 or pu.pragyapan_number ilike $2 or s.name ilike $2 or exists (
+      where += ` and (pu.invoice_number ilike $${params.length} or pu.pragyapan_number ilike $${params.length} or s.name ilike $${params.length} or exists (
         select 1 from purchase_invoice_lines pl join products p on p.id = pl.product_id
-        where pl.purchase_invoice_id = pu.id and p.name ilike $2
+        where pl.purchase_invoice_id = pu.id and p.name ilike $${params.length}
       ))`;
     }
+    if (from) { params.push(from); where += ` and pu.date >= $${params.length}`; }
+    if (till) { params.push(till); where += ` and pu.date <= $${params.length}`; }
+    if (type === 'cash') where += ` and pu.credit_amount <= 0`;
+    else if (type === 'credit') where += ` and pu.credit_amount > 0`;
+
     const { rows } = await pool.query(
       `select pu.*, s.name as supplier_name, a.name as account_name
        from purchase_invoices pu
@@ -43,7 +51,19 @@ router.get('/', async (req, res, next) => {
        order by pu.date desc, pu.created_at desc`,
       params
     );
-    res.json(await attachLines(rows));
+    const invoices = await attachLines(rows);
+
+    const summary = invoices.reduce(
+      (acc, p) => {
+        acc.total += Number(p.total);
+        if (Number(p.credit_amount) <= 0) acc.cashTotal += Number(p.total);
+        else { acc.creditTotal += Number(p.total); acc.creditOutstanding += Number(p.credit_amount); }
+        return acc;
+      },
+      { total: 0, cashTotal: 0, creditTotal: 0, creditOutstanding: 0 }
+    );
+
+    res.json({ invoices, summary });
   } catch (err) { next(err); }
 });
 

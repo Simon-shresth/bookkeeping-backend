@@ -23,6 +23,8 @@ const usersRoutes = require('./routes/users');
 const paymentsRoutes = require('./routes/payments');
 const reconciliationRoutes = require('./routes/reconciliation');
 const auditRoutes = require('./routes/audit');
+const employeesRoutes = require('./routes/employees');
+const salaryRoutes = require('./routes/salary');
 const { pool } = require('./db');
 
 
@@ -74,6 +76,8 @@ app.use('/api/users', usersRoutes);
 app.use('/api/payments', paymentsRoutes);
 app.use('/api/reconciliation', reconciliationRoutes);
 app.use('/api/audit', auditRoutes);
+app.use('/api/employees', employeesRoutes);
+app.use('/api/salary', salaryRoutes);
 
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));

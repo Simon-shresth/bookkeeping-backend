@@ -23,19 +23,27 @@ async function attachLines(invoices) {
   return invoices.map((i) => ({ ...i, lines: byInvoice[i.id] || [] }));
 }
 
-// GET /api/sales?q=search
+// GET /api/sales?q=search&from=YYYY-MM-DD&till=YYYY-MM-DD&type=cash|credit|all
 router.get('/', async (req, res, next) => {
   try {
     const q = (req.query.q || '').trim();
+    const from = (req.query.from || '').trim();
+    const till = (req.query.till || '').trim();
+    const type = (req.query.type || '').trim(); // 'cash' | 'credit' | ''
     const params = [req.user.company_id];
     let where = 'where s.company_id = $1';
     if (q) {
       params.push(`%${q}%`);
-      where += ` and (s.invoice_number ilike $2 or c.name ilike $2 or exists (
+      where += ` and (s.invoice_number ilike $${params.length} or c.name ilike $${params.length} or exists (
         select 1 from sales_invoice_lines sl join products p on p.id = sl.product_id
-        where sl.sales_invoice_id = s.id and p.name ilike $2
+        where sl.sales_invoice_id = s.id and p.name ilike $${params.length}
       ))`;
     }
+    if (from) { params.push(from); where += ` and s.date >= $${params.length}`; }
+    if (till) { params.push(till); where += ` and s.date <= $${params.length}`; }
+    if (type === 'cash') where += ` and s.cash_sale = true`;
+    else if (type === 'credit') where += ` and s.cash_sale = false`;
+
     const { rows } = await pool.query(
       `select s.*, c.name as customer_name, a.name as account_name
        from sales_invoices s
@@ -45,7 +53,20 @@ router.get('/', async (req, res, next) => {
        order by s.date desc, s.created_at desc`,
       params
     );
-    res.json(await attachLines(rows));
+    const invoices = await attachLines(rows);
+
+    // Summary totals over the filtered result set
+    const summary = invoices.reduce(
+      (acc, s) => {
+        acc.total += Number(s.total);
+        if (s.cash_sale) acc.cashTotal += Number(s.total);
+        else { acc.creditTotal += Number(s.total); acc.creditOutstanding += Number(s.credit_amount); }
+        return acc;
+      },
+      { total: 0, cashTotal: 0, creditTotal: 0, creditOutstanding: 0 }
+    );
+
+    res.json({ invoices, summary });
   } catch (err) { next(err); }
 });
 

@@ -34,6 +34,7 @@ const lineSchema = z.object({
 const entrySchema = z.object({
   date: z.string(),
   memo: z.string().min(1),
+  remark: z.string().optional(),
   lines: z.array(lineSchema).min(2),
 });
 
@@ -47,6 +48,7 @@ router.post('/', requireRole('accountant'), async (req, res, next) => {
         companyId: req.user.company_id,
         date: body.date,
         memo: body.memo,
+        remark: body.remark,
         source: 'Manual',
         lines: body.lines,
         createdBy: req.user.id,
@@ -79,6 +81,7 @@ router.put('/:id', requireRole('accountant'), async (req, res, next) => {
         companyId: req.user.company_id,
         date: body.date,
         memo: body.memo,
+        remark: body.remark,
         source: 'Manual',
         lines: body.lines,
         createdBy: req.user.id,
