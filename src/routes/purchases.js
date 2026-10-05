@@ -80,6 +80,7 @@ const lineSchema = z.object({
 }).refine((l) => l.productId || l.newProduct, { message: 'Provide either productId or newProduct' });
 
 const purchaseSchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   invoiceNumber: z.string().optional(),
   pragyapanNumber: z.string().optional(),
   supplierId: z.string().uuid(),
@@ -134,7 +135,7 @@ async function createPurchaseWithinTx(client, companyId, userId, body) {
     await client.query('update products set stock = stock + $1 where id = $2', [l.qty, l.product.id]);
   }
 
-  const date = await companyToday(client, companyId);
+  const date = body.date || await companyToday(client, companyId);
   const invAcct = await heading(client, companyId, 'Inventory');
   const invoiceRef = (body.invoiceNumber ? ' — Invoice ' + body.invoiceNumber : '') + (body.pragyapanNumber ? ' — PP ' + body.pragyapanNumber : '');
 

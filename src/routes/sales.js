@@ -109,6 +109,7 @@ router.get('/:id/pdf', async (req, res, next) => {
 
 const lineSchema = z.object({ productId: z.string().uuid(), qty: z.number().positive(), price: z.number().min(0), unit: z.string().min(1) });
 const saleSchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   invoiceNumber: z.string().optional(),
   customerId: z.string().uuid(),
   lines: z.array(lineSchema).min(1, 'Add at least one product.'),
@@ -172,7 +173,7 @@ async function createSaleWithinTx(client, companyId, userId, body) {
     await client.query('update products set stock = stock - $1 where id = $2', [l.baseQty, l.product.id]);
   }
 
-  const date = await companyToday(client, companyId);
+  const date = body.date || await companyToday(client, companyId);
   const salesAcct = await heading(client, companyId, 'Sales');
   const invoiceRef = body.invoiceNumber ? ' — Invoice ' + body.invoiceNumber : '';
 

@@ -23,6 +23,7 @@ router.get('/', async (req, res, next) => {
 });
 
 const schema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   categoryAccountId: z.string().uuid(),
   note: z.string().optional(),
   amount: z.number().positive(),
@@ -33,7 +34,7 @@ async function createExpenseWithinTx(client, companyId, userId, body) {
   const catRes = await client.query('select name from accounts where id=$1 and company_id=$2', [body.categoryAccountId, companyId]);
   if (!catRes.rows[0]) { const e = new Error('Category account not found'); e.status = 404; throw e; }
 
-  const date = await companyToday(client, companyId);
+  const date = body.date || await companyToday(client, companyId);
   const memo = `${catRes.rows[0].name} expense${body.note ? ' — ' + body.note : ''}`;
   const lines = [
     { accountId: body.categoryAccountId, debit: body.amount, credit: 0 },
