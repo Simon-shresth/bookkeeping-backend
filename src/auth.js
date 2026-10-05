@@ -111,7 +111,10 @@ async function requireAuth(req, res, next) {
     let user = getCachedUser(payload.sub);
     if (!user) {
       const { rows } = await db().query(
-        'select id, company_id, email, role, is_active from users where id = $1',
+        `select u.id, u.company_id, u.email, u.role, u.is_active, c.name as company_name
+         from users u
+         join companies c on c.id = u.company_id
+         where u.id = $1`,
         [payload.sub]
       );
       user = rows[0];
