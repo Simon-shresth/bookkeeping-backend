@@ -31,11 +31,6 @@ function bucketFor(days) {
   return '61+';
 }
 
-// Invoices are never modified by payments (so editing/deleting either stays
-// safe). Instead, at report time each party's payments are applied to their
-// oldest credit invoices first (FIFO); whatever is left on an invoice is
-// what's still outstanding. Payments beyond total invoices (advances) simply
-// don't appear as an invoice row.
 function applyFifo(invoices, paidByParty) {
   const remaining = { ...paidByParty };
   const today = Date.now();
@@ -66,12 +61,12 @@ function summarize(rows) {
   return buckets;
 }
 
-// Helper: get journal movements for parties (suppliers/customers) that are not already represented by invoices/payments
-async function getJournalMovements(client, companyId, partyTable, idCol, excludedSources) {
+// Helper: get journal movements with dynamic party field alias ('customer' or 'supplier')
+async function getJournalMovements(client, companyId, partyTable, idCol, excludedSources, partyField) {
   const placeholders = excludedSources.map((_, idx) => `$${idx + 2}`).join(',');
   const query = `
     select je.id, je.date::text as date, je.memo, je.reference, je.source,
-           s.id as party_id, s.name as party_name,
+           s.id as party_id, s.name as ${partyField},
            sum(jl.credit - jl.debit) as amount
     from journal_lines jl
     join journal_entries je on je.id = jl.journal_entry_id
@@ -101,7 +96,6 @@ router.get('/ar-aging', async (req, res, next) => {
   try {
     const companyId = req.user.company_id;
 
-    // 1. Invoice-based rows (existing logic)
     const { rows: invoices } = await client.query(
       `select s.id, s.date::text as date, s.invoice_number, c.id as party_id, c.name as customer, s.total, s.credit_amount
        from sales_invoices s join customers c on c.id = s.customer_id
@@ -115,16 +109,13 @@ router.get('/ar-aging', async (req, res, next) => {
       [companyId]
     );
     const paidByParty = Object.fromEntries(paid.map((p) => [p.customer_id, Number(p.total)]));
-    // applyFifo already sets original/outstanding correctly; just tag with kind and drop internal fields
     const invoiceRows = applyFifo(invoices, paidByParty).map(({ party_id, credit_amount, ...r }) => ({
       ...r,
       kind: 'invoice',
     }));
 
-    // 2. Journal-based rows (new)
-    const journalRows = await getJournalMovements(client, companyId, 'customers', 'account_id', ['Sale', 'Payment']);
+    const journalRows = await getJournalMovements(client, companyId, 'customers', 'account_id', ['Sale', 'Payment'], 'customer');
 
-    // 3. Combine and compute buckets
     const allRows = [...invoiceRows, ...journalRows];
     const rowsWithAge = allRows.map(row => {
       const today = Date.now();
@@ -148,7 +139,6 @@ router.get('/ap-aging', async (req, res, next) => {
   try {
     const companyId = req.user.company_id;
 
-    // 1. Invoice-based rows (existing logic)
     const { rows: invoices } = await client.query(
       `select p.id, p.date::text as date, p.invoice_number, p.pragyapan_number, s.id as party_id, s.name as supplier, p.total, p.credit_amount
        from purchase_invoices p join suppliers s on s.id = p.supplier_id
@@ -162,16 +152,14 @@ router.get('/ap-aging', async (req, res, next) => {
       [companyId]
     );
     const paidByParty = Object.fromEntries(paid.map((p) => [p.supplier_id, Number(p.total)]));
-    // applyFifo already sets original/outstanding correctly; just tag with kind and drop internal fields
     const invoiceRows = applyFifo(invoices, paidByParty).map(({ party_id, credit_amount, ...r }) => ({
       ...r,
       kind: 'invoice',
     }));
 
-    // 2. Journal-based rows (new)
-    const journalRows = await getJournalMovements(client, companyId, 'suppliers', 'account_id', ['Purchase', 'Payment']);
+    // Passed 'supplier' so rows correctly contain the supplier property expected by the frontend
+    const journalRows = await getJournalMovements(client, companyId, 'suppliers', 'account_id', ['Purchase', 'Payment'], 'supplier');
 
-    // 3. Combine and compute buckets
     const allRows = [...invoiceRows, ...journalRows];
     const rowsWithAge = allRows.map(row => {
       const today = Date.now();
