@@ -7,22 +7,38 @@ const { audit } = require('../services/audit');
 
 const router = express.Router();
 
-// GET /api/journal — list all entries (manual and auto-generated), newest first
+// GET /api/journal?page=1&limit=50 — paginated list, newest first
 router.get('/', async (req, res, next) => {
   try {
-    const { rows: entries } = await pool.query(
-      'select * from journal_entries where company_id=$1 order by date desc, created_at desc',
-      [req.user.company_id]
+    const companyId = req.user.company_id;
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200);
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const offset = (page - 1) * limit;
+
+    const { rows: [{ total }] } = await pool.query(
+      'select count(*)::int as total from journal_entries where company_id=$1',
+      [companyId]
     );
-    const { rows: lines } = await pool.query(
+
+    const { rows: entries } = await pool.query(
+      'select * from journal_entries where company_id=$1 order by date desc, created_at desc limit $2 offset $3',
+      [companyId, limit, offset]
+    );
+    const { rows: lines } = entries.length ? await pool.query(
       `select jl.*, a.name as account_name from journal_lines jl
        join accounts a on a.id = jl.account_id
        where jl.journal_entry_id = any($1::uuid[])`,
       [entries.map((e) => e.id)]
-    );
+    ) : { rows: [] };
     const byEntry = {};
     for (const l of lines) (byEntry[l.journal_entry_id] ||= []).push(l);
-    res.json(entries.map((e) => ({ ...e, lines: byEntry[e.id] || [] })));
+    res.json({
+      entries: entries.map((e) => ({ ...e, lines: byEntry[e.id] || [] })),
+      total,
+      page,
+      limit,
+      pages: Math.ceil(total / limit),
+    });
   } catch (err) { next(err); }
 });
 

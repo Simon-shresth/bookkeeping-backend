@@ -21,13 +21,17 @@ async function attachLines(invoices) {
   return invoices.map((i) => ({ ...i, lines: byInvoice[i.id] || [] }));
 }
 
-// GET /api/purchases?q=search&from=YYYY-MM-DD&till=YYYY-MM-DD&type=cash|credit|all
+// GET /api/purchases?q=search&from=YYYY-MM-DD&till=YYYY-MM-DD&type=cash|credit&page=1&limit=50
 router.get('/', async (req, res, next) => {
   try {
     const q = (req.query.q || '').trim();
     const from = (req.query.from || '').trim();
     const till = (req.query.till || '').trim();
-    const type = (req.query.type || '').trim(); // 'cash' (fully paid) | 'credit' | ''
+    const type = (req.query.type || '').trim();
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200);
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const offset = (page - 1) * limit;
+
     const params = [req.user.company_id];
     let where = 'where pu.company_id = $1';
     if (q) {
@@ -42,14 +46,21 @@ router.get('/', async (req, res, next) => {
     if (type === 'cash') where += ` and pu.credit_amount <= 0`;
     else if (type === 'credit') where += ` and pu.credit_amount > 0`;
 
+    // Count total matching rows for pagination metadata
+    const { rows: [{ total }] } = await pool.query(
+      `select count(*)::int as total from purchase_invoices pu join suppliers s on s.id = pu.supplier_id ${where}`,
+      params
+    );
+
     const { rows } = await pool.query(
       `select pu.*, s.name as supplier_name, a.name as account_name
        from purchase_invoices pu
        join suppliers s on s.id = pu.supplier_id
        left join accounts a on a.id = pu.payment_account_id
        ${where}
-       order by pu.date desc, pu.created_at desc`,
-      params
+       order by pu.date desc, pu.created_at desc
+       limit $${params.length + 1} offset $${params.length + 2}`,
+      [...params, limit, offset]
     );
     const invoices = await attachLines(rows);
 
@@ -63,7 +74,7 @@ router.get('/', async (req, res, next) => {
       { total: 0, cashTotal: 0, creditTotal: 0, creditOutstanding: 0 }
     );
 
-    res.json({ invoices, summary });
+    res.json({ invoices, summary, total, page, limit, pages: Math.ceil(total / limit) });
   } catch (err) { next(err); }
 });
 
