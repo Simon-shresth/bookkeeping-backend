@@ -3,6 +3,7 @@ const { z } = require('zod');
 const { pool, withTransaction } = require('../db');
 const { requireRole } = require('../auth');
 const { ensureSubAccount, getAccountBalance } = require('../services/ledger');
+const { buildPartyStatementPdf } = require('../services/partyStatementPdf');
 
 const router = express.Router();
 
@@ -71,6 +72,24 @@ router.delete('/:id', requireRole('manager'), async (req, res, next) => {
     if (err.code === '23503') return res.status(409).json({ error: 'This customer has invoices on record and cannot be deleted. Financial history must be preserved.' });
     next(err);
   }
+});
+
+// GET /api/customers/statement/pdf — PDF of all customers with outstanding balances
+router.get('/statement/pdf', async (req, res, next) => {
+  try {
+    const companyId = req.user.company_id;
+    const { rows } = await pool.query('select * from customers where company_id=$1 order by name', [companyId]);
+    const parties = await Promise.all(rows.map(async (c) => ({
+      name: c.name,
+      contact: c.contact,
+      outstanding: await getAccountBalance(companyId, c.account_id),
+    })));
+    const { rows: co } = await pool.query('select name, currency from companies where id=$1', [companyId]);
+    const pdf = await buildPartyStatementPdf({ company: co[0], parties, kind: 'Accounts Receivable' });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename="customers-outstanding.pdf"');
+    res.send(pdf);
+  } catch (err) { next(err); }
 });
 
 module.exports = router;

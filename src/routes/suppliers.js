@@ -3,6 +3,7 @@ const { z } = require('zod');
 const { pool, withTransaction } = require('../db');
 const { requireRole } = require('../auth');
 const { ensureSubAccount, getAccountBalance } = require('../services/ledger');
+const { buildPartyStatementPdf } = require('../services/partyStatementPdf');
 
 const router = express.Router();
 
@@ -66,6 +67,24 @@ router.delete('/:id', requireRole('manager'), async (req, res, next) => {
     if (err.code === '23503') return res.status(409).json({ error: 'This supplier has purchases on record and cannot be deleted. Financial history must be preserved.' });
     next(err);
   }
+});
+
+// GET /api/suppliers/statement/pdf — PDF of all suppliers with outstanding balances
+router.get('/statement/pdf', async (req, res, next) => {
+  try {
+    const companyId = req.user.company_id;
+    const { rows } = await pool.query('select * from suppliers where company_id=$1 order by name', [companyId]);
+    const parties = await Promise.all(rows.map(async (s) => ({
+      name: s.name,
+      contact: s.contact,
+      outstanding: await getAccountBalance(companyId, s.account_id),
+    })));
+    const { rows: co } = await pool.query('select name, currency from companies where id=$1', [companyId]);
+    const pdf = await buildPartyStatementPdf({ company: co[0], parties, kind: 'Accounts Payable' });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename="suppliers-outstanding.pdf"');
+    res.send(pdf);
+  } catch (err) { next(err); }
 });
 
 module.exports = router;
