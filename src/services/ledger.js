@@ -247,24 +247,31 @@ async function getTotals(companyId) {
 async function getBalanceSheet(companyId) {
   const balances = await getAllBalances(companyId);
   const { rows: accounts } = await pool.query(
-    'select id, name, category from accounts where company_id=$1',
+    'select id, name, heading, category from accounts where company_id=$1',
     [companyId]
   );
 
-  const byCategory = (cat) =>
-    accounts
-      .filter((a) => a.category === cat)
-      .map((a) => ({ name: a.name, balance: balances.get(a.id) || 0 }));
+  // Group accounts by heading within each category, summing balances per heading.
+  // This mirrors Chart of Accounts presentation: one row per heading, not per account.
+  const byCategory = (cat) => {
+    const headingMap = {};
+    for (const a of accounts) {
+      if (a.category !== cat) continue;
+      if (!headingMap[a.heading]) headingMap[a.heading] = 0;
+      headingMap[a.heading] += balances.get(a.id) || 0;
+    }
+    return Object.entries(headingMap).map(([heading, balance]) => ({ heading, balance }));
+  };
 
   const assets = byCategory('Assets');
   const liabilities = byCategory('Liabilities');
-  const equityAccounts = byCategory('Equity');
+  const equityHeadings = byCategory('Equity');
   const t = await getTotals(companyId);
   const currentEarnings = t.revenue - t.cogs - t.expenseTotal;
   const totalAssets = assets.reduce((s, a) => s + a.balance, 0);
   const totalLiabilities = liabilities.reduce((s, a) => s + a.balance, 0);
-  const totalEquity = equityAccounts.reduce((s, a) => s + a.balance, 0) + currentEarnings;
-  return { assets, liabilities, equityAccounts, currentEarnings, totalAssets, totalLiabilities, totalEquity, balanced: Math.abs(totalAssets - (totalLiabilities + totalEquity)) < 0.01 };
+  const totalEquity = equityHeadings.reduce((s, a) => s + a.balance, 0) + currentEarnings;
+  return { assets, liabilities, equityHeadings, currentEarnings, totalAssets, totalLiabilities, totalEquity, balanced: Math.abs(totalAssets - (totalLiabilities + totalEquity)) < 0.01 };
 }
 
 module.exports = {
