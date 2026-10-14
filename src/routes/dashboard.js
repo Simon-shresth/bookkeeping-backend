@@ -1,6 +1,6 @@
 const express = require('express');
 const { pool } = require('../db');
-const { getTotals } = require('../services/ledger');
+const { getTotals, getAccountBalance } = require('../services/ledger');
 
 const router = express.Router();
 
@@ -8,7 +8,7 @@ router.get('/', async (req, res, next) => {
   try {
     const companyId = req.user.company_id;
 
-    const [totals, { rows: lowStock }, { rows: recent }] = await Promise.all([
+    const [totals, { rows: lowStock }, { rows: recent }, { rows: loanRows }] = await Promise.all([
       getTotals(companyId),
       pool.query(
         'select id, name, stock, min_stock from products where company_id=$1 and stock <= min_stock order by name',
@@ -26,9 +26,45 @@ router.get('/', async (req, res, next) => {
          order by date desc limit 8`,
         [companyId]
       ),
+      // Fetch all loans for this company with their account metadata
+      pool.query(
+        `select l.id, l.lender_name, l.principal, l.interest_rate, l.start_date::text as start_date,
+                a.id as account_id, a.name as account_name
+         from loans l
+         join accounts a on a.id = l.account_id
+         where l.company_id = $1
+         order by l.start_date asc`,
+        [companyId]
+      ),
     ]);
 
-    res.json({ totals, lowStock, recentTransactions: recent });
+    // Compute current outstanding balance per loan from the ledger
+    const today = Date.now();
+    const loanAgeing = await Promise.all(loanRows.map(async (loan) => {
+      const balance = await getAccountBalance(companyId, loan.account_id);
+      // balance for a Liability account is positive when money is owed
+      const daysSinceStart = loan.start_date
+        ? Math.floor((today - new Date(loan.start_date).getTime()) / 86400000)
+        : null;
+      const bucket = daysSinceStart == null ? 'Unknown'
+        : daysSinceStart <= 90 ? '0-90 days'
+        : daysSinceStart <= 180 ? '91-180 days'
+        : daysSinceStart <= 365 ? '181-365 days'
+        : '1+ years';
+      return {
+        id: loan.id,
+        lender_name: loan.lender_name || loan.account_name,
+        account_name: loan.account_name,
+        principal: Number(loan.principal) || null,
+        interest_rate: loan.interest_rate != null ? Number(loan.interest_rate) : null,
+        start_date: loan.start_date,
+        balance,
+        days_outstanding: daysSinceStart,
+        bucket,
+      };
+    }));
+
+    res.json({ totals, lowStock, recentTransactions: recent, loanAgeing });
   } catch (err) { next(err); }
 });
 
