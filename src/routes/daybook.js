@@ -2,6 +2,7 @@ const express = require('express');
 const { z } = require('zod');
 const { pool, withTransaction } = require('../db');
 const { audit } = require('../services/audit');
+const { postJournal, reverseJournalEntry } = require('../services/ledger');
 
 const router = express.Router();
 
@@ -38,7 +39,7 @@ router.get('/', async (req, res, next) => {
     // 1. Petty cash day book entries for the day
     const { rows: entries } = await client.query(
       `select dbe.id, dbe.entry_date::text as entry_date, dbe.type,
-              dbe.amount, dbe.narration, dbe.created_at,
+              dbe.amount, dbe.narration, dbe.journal_entry_id, dbe.created_at,
               a.name as account_name, a.heading, a.category
        from day_book_entries dbe
        join accounts a on a.id = dbe.account_id
@@ -89,7 +90,7 @@ router.get('/', async (req, res, next) => {
       const lines = linesByEntry[e.id] || [];
       const arApLine = lines.find((l) => l.heading === 'Accounts Receivable' || l.heading === 'Accounts Payable');
       const party = arApLine?.account_name || null;
-      const typeMap = { Sale: 'SALE', Purchase: 'PURCHASE', Expense: 'EXPENSE', Salary: 'EXPENSE', Payment: e.memo?.toLowerCase().includes('received') ? 'RECEIPT' : 'PAYMENT', Manual: 'JOURNAL', 'Opening Balance': 'JOURNAL' };
+      const typeMap = { Sale: 'SALE', Purchase: 'PURCHASE', Expense: 'EXPENSE', Salary: 'EXPENSE', Payment: e.memo?.toLowerCase().includes('received') ? 'RECEIPT' : 'PAYMENT', Manual: 'JOURNAL', 'Opening Balance': 'JOURNAL', 'Day Book': 'JOURNAL' };
       return {
         id: e.id, date: e.date, transaction_type: typeMap[e.source] || 'JOURNAL',
         source: e.source, ref_no: e.reference || null, party,
@@ -148,6 +149,18 @@ router.post('/', async (req, res, next) => {
     const date = body.date || new Date().toISOString().slice(0, 10);
 
     const inserted = await withTransaction(async (client) => {
+      // Find system Cash account
+      const { rows: cashAccs } = await client.query(
+        "select id, name from accounts where company_id=$1 and heading='Cash' and is_system=true order by created_at asc limit 1",
+        [companyId]
+      );
+      if (!cashAccs[0]) {
+        const e = new Error('System Cash account not found');
+        e.status = 500;
+        throw e;
+      }
+      const cashAccountId = cashAccs[0].id;
+
       const rows = [];
       for (const line of body.lines) {
         // Verify account belongs to this company
@@ -156,14 +169,45 @@ router.post('/', async (req, res, next) => {
           [line.accountId, companyId]
         );
         if (!accs[0]) { const e = new Error(`Account not found: ${line.accountId}`); e.status = 404; throw e; }
+        const targetAccount = accs[0];
+
+        // Double-entry GL posting:
+        // INFLOW: Debit Cash, Credit Target Account
+        // OUTFLOW: Debit Target Account, Credit Cash
+        const amount = Math.round(Number(line.amount) * 100) / 100;
+        const journalLines = line.type === 'INFLOW'
+          ? [
+              { accountId: cashAccountId, debit: amount, credit: 0 },
+              { accountId: line.accountId, debit: 0, credit: amount },
+            ]
+          : [
+              { accountId: line.accountId, debit: amount, credit: 0 },
+              { accountId: cashAccountId, debit: 0, credit: amount },
+            ];
+
+        const defaultMemo = line.type === 'INFLOW'
+          ? `Day Book Inflow — ${targetAccount.name}`
+          : `Day Book Outflow — ${targetAccount.name}`;
+        const memo = line.narration ? `Day Book: ${line.narration}` : defaultMemo;
+
+        const entry = await postJournal(client, {
+          companyId,
+          date,
+          memo,
+          remark: line.narration || undefined,
+          source: 'Day Book',
+          lines: journalLines,
+          createdBy: req.user.id,
+        });
 
         const { rows: [row] } = await client.query(
-          `insert into day_book_entries (company_id, entry_date, account_id, type, amount, narration, created_by)
-           values ($1,$2,$3,$4,$5,$6,$7) returning *`,
-          [companyId, date, line.accountId, line.type, line.amount, line.narration || null, req.user.id]
+          `insert into day_book_entries (company_id, entry_date, account_id, type, amount, narration, journal_entry_id, created_by)
+           values ($1,$2,$3,$4,$5,$6,$7,$8) returning *`,
+          [companyId, date, line.accountId, line.type, amount, line.narration || null, entry?.id || null, req.user.id]
         );
-        rows.push({ ...row, account_name: accs[0].name });
+        rows.push({ ...row, account_name: targetAccount.name, journal_entry_id: entry?.id || null });
       }
+
       await audit(client, {
         companyId, userId: req.user.id, action: 'create',
         entity: 'day_book_entries', entityId: rows[0]?.id,
@@ -181,17 +225,43 @@ router.post('/', async (req, res, next) => {
 });
 
 // ── DELETE /api/daybook/:id ───────────────────────────────────────────────────
-// Remove a single petty cash entry by id.
+// Remove a single petty cash entry by id and reverse its journal entry.
 router.delete('/:id', async (req, res, next) => {
   try {
     const companyId = req.user.company_id;
-    const { rowCount } = await pool.query(
-      'delete from day_book_entries where id=$1 and company_id=$2',
-      [req.params.id, companyId]
-    );
-    if (!rowCount) return res.status(404).json({ error: 'Not found' });
+    await withTransaction(async (client) => {
+      const { rows } = await client.query(
+        'select * from day_book_entries where id=$1 and company_id=$2',
+        [req.params.id, companyId]
+      );
+      if (!rows[0]) {
+        const e = new Error('Not found');
+        e.status = 404;
+        throw e;
+      }
+      const entry = rows[0];
+
+      if (entry.journal_entry_id) {
+        await reverseJournalEntry(client, entry.journal_entry_id);
+      }
+
+      await client.query(
+        'delete from day_book_entries where id=$1 and company_id=$2',
+        [req.params.id, companyId]
+      );
+
+      await audit(client, {
+        companyId, userId: req.user.id, action: 'delete',
+        entity: 'day_book_entries', entityId: entry.id,
+        details: { amount: entry.amount, type: entry.type },
+      });
+    });
+
     res.status(204).end();
-  } catch (err) { next(err); }
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
 });
 
 module.exports = router;
