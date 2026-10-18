@@ -216,17 +216,26 @@ async function getChartOfAccounts(companyId) {
   return result;
 }
 
-async function getTotals(companyId) {
+// Same as getTotals but bounded to a date range (inclusive of from and till).
+// Used by fiscal-year-aware P&L and balance-sheet earnings computation.
+async function getTotalsForPeriod(companyId, from, till) {
+  const params = [companyId];
+  let dateWhere = '';
+  if (from) { params.push(from); dateWhere += ` and je.date >= $${params.length}`; }
+  if (till) { params.push(till); dateWhere += ` and je.date <= $${params.length}`; }
+
   const { rows } = await pool.query(
     `select a.id, a.category, a.heading,
             coalesce(sum(jl.debit), 0) as debit,
             coalesce(sum(jl.credit), 0) as credit
      from accounts a
      left join journal_lines jl on jl.account_id = a.id
-     left join journal_entries je on je.id = jl.journal_entry_id and je.company_id = a.company_id
+     left join journal_entries je on je.id = jl.journal_entry_id
+          and je.company_id = a.company_id
      where a.company_id = $1 and a.category in ('Income', 'Expenses', 'Assets', 'Liabilities')
+     ${dateWhere}
      group by a.id, a.category, a.heading`,
-    [companyId]
+    params
   );
 
   let revenue = 0, cogs = 0, expenseTotal = 0, ar = 0, ap = 0;
@@ -240,8 +249,40 @@ async function getTotals(companyId) {
     else if (r.category === 'Assets' && r.heading === 'Accounts Receivable') ar += bal;
     else if (r.category === 'Liabilities' && r.heading === 'Accounts Payable') ap += bal;
   }
-
   return { revenue, cogs, expenseTotal, ar, ap, profit: revenue - cogs - expenseTotal };
+}
+
+// Returns the company's current open fiscal year, or null if none exists.
+// Reads from the fiscal_years table (migration 012).
+async function getCurrentFiscalYear(companyId) {
+  const { rows } = await pool.query(
+    `select * from fiscal_years
+     where company_id = $1 and status = 'open'
+     order by start_date desc limit 1`,
+    [companyId]
+  );
+  return rows[0] || null;
+}
+
+// Returns all closed fiscal years for a company, oldest first.
+async function getClosedFiscalYears(companyId) {
+  const { rows } = await pool.query(
+    `select * from fiscal_years
+     where company_id = $1 and status = 'closed'
+     order by start_date asc`,
+    [companyId]
+  );
+  return rows;
+}
+
+// P&L totals. When fiscal years exist, defaults to the current open year's
+// bounds so P&L (and the Dashboard net profit) only reflect current-year
+// activity. Pass { allTime: true } to force all-time totals.
+async function getTotals(companyId, opts = {}) {
+  if (opts.allTime) return getTotalsForPeriod(companyId, undefined, undefined);
+  const fy = await getCurrentFiscalYear(companyId);
+  if (!fy) return getTotalsForPeriod(companyId, undefined, undefined);
+  return getTotalsForPeriod(companyId, fy.start_date, fy.end_date);
 }
 
 async function getBalanceSheet(companyId) {
@@ -259,12 +300,43 @@ async function getBalanceSheet(companyId) {
   const assets = byCategory('Assets');
   const liabilities = byCategory('Liabilities');
   const equityAccounts = byCategory('Equity');
-  const t = await getTotals(companyId);
-  const currentEarnings = t.revenue - t.cogs - t.expenseTotal;
+
+  // Earnings folded into equity:
+  // - closedYearsEarnings: net profit across all closed fiscal years, rolled
+  //   into Retained Earnings (no posted closing entry; computed on demand).
+  // - currentEarnings: net profit for the current open fiscal year only.
+  const currentFy = await getCurrentFiscalYear(companyId);
+  const closedYears = await getClosedFiscalYears(companyId);
+
+  let closedYearsEarnings = 0;
+  for (const fy of closedYears) {
+    const t = await getTotalsForPeriod(companyId, fy.start_date, fy.end_date);
+    closedYearsEarnings += t.profit;
+  }
+
+  let currentEarnings = 0;
+  if (currentFy) {
+    const t = await getTotalsForPeriod(companyId, currentFy.start_date, currentFy.end_date);
+    currentEarnings = t.profit;
+  } else {
+    // No fiscal years set up — fall back to all-time earnings (legacy behaviour)
+    const t = await getTotalsForPeriod(companyId, undefined, undefined);
+    currentEarnings = t.profit;
+  }
+
   const totalAssets = assets.reduce((s, a) => s + a.balance, 0);
   const totalLiabilities = liabilities.reduce((s, a) => s + a.balance, 0);
-  const totalEquity = equityAccounts.reduce((s, a) => s + a.balance, 0) + currentEarnings;
-  return { assets, liabilities, equityAccounts, currentEarnings, totalAssets, totalLiabilities, totalEquity, balanced: Math.abs(totalAssets - (totalLiabilities + totalEquity)) < 0.01 };
+  const totalEquity = equityAccounts.reduce((s, a) => s + a.balance, 0)
+    + closedYearsEarnings
+    + currentEarnings;
+
+  return {
+    assets, liabilities, equityAccounts,
+    currentEarnings,
+    closedYearsEarnings,
+    totalAssets, totalLiabilities, totalEquity,
+    balanced: Math.abs(totalAssets - (totalLiabilities + totalEquity)) < 0.01,
+  };
 }
 
 module.exports = {
@@ -278,6 +350,9 @@ module.exports = {
   getAccountLedger,
   getChartOfAccounts,
   getTotals,
+  getTotalsForPeriod,
+  getCurrentFiscalYear,
+  getClosedFiscalYears,
   getBalanceSheet,
   DEFAULT_HEADINGS,
 };
