@@ -1,6 +1,6 @@
 const express = require('express');
 const { pool } = require('../db');
-const { getAccountLedger } = require('../services/ledger');
+const { getAccountLedger, getCurrentFiscalYear } = require('../services/ledger');
 const { buildLedgerPdf } = require('../services/ledgerPdf');
 
 const router = express.Router();
@@ -12,21 +12,40 @@ function parseRange(req) {
   return { from, till };
 }
 
-// GET /api/ledger/:accountId?from=YYYY-MM-DD&till=YYYY-MM-DD
-// Both dates are optional; omitting both returns the full history (as before).
+// GET /api/ledger/:accountId?from=YYYY-MM-DD&till=YYYY-MM-DD&allYears=true
+// By default, limits to the current fiscal year: opening balance = sum of all
+// journal lines before the fiscal year start; only current-year entries are
+// shown. Pass allYears=true (or an explicit from) to see prior-year history.
 router.get('/:accountId', async (req, res, next) => {
   try {
-    const ledger = await getAccountLedger(req.user.company_id, req.params.accountId, parseRange(req));
+    const companyId = req.user.company_id;
+    let { from, till } = parseRange(req);
+    const allYears = req.query.allYears === 'true';
+
+    // If no explicit from and not allYears, default to current fiscal year start
+    if (!from && !allYears) {
+      const fy = await getCurrentFiscalYear(companyId);
+      if (fy) from = fy.start_date;
+    }
+
+    const ledger = await getAccountLedger(companyId, req.params.accountId, { from, till });
     if (!ledger) return res.status(404).json({ error: 'Account not found' });
-    res.json(ledger);
+    res.json({ ...ledger, from, till });
   } catch (err) { next(err); }
 });
 
-// GET /api/ledger/:accountId/pdf?from=&till=
+// GET /api/ledger/:accountId/pdf?from=&till=&allYears=true
 router.get('/:accountId/pdf', async (req, res, next) => {
   try {
     const companyId = req.user.company_id;
-    const { from, till } = parseRange(req);
+    let { from, till } = parseRange(req);
+    const allYears = req.query.allYears === 'true';
+
+    if (!from && !allYears) {
+      const fy = await getCurrentFiscalYear(companyId);
+      if (fy) from = fy.start_date;
+    }
+
     const ledger = await getAccountLedger(companyId, req.params.accountId, { from, till });
     if (!ledger) return res.status(404).json({ error: 'Account not found' });
 
