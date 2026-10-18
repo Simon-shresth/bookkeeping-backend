@@ -12,7 +12,12 @@ const router = express.Router();
 async function attachLines(invoices) {
   if (!invoices.length) return invoices;
   const { rows: lines } = await pool.query(
-    `select pl.*, p.name as product_name from purchase_invoice_lines pl join products p on p.id = pl.product_id
+    `select pl.*,
+            p.name as product_name,
+            a.name as account_name
+     from purchase_invoice_lines pl
+     left join products p on p.id = pl.product_id
+     left join accounts a on a.id = pl.account_id
      where pl.purchase_invoice_id = any($1::uuid[]) order by pl.id`,
     [invoices.map((i) => i.id)]
   );
@@ -78,7 +83,9 @@ router.get('/', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-const lineSchema = z.object({
+// Product line: productId or newProduct
+const productLineSchema = z.object({
+  lineType: z.literal('product').default('product'),
   productId: z.string().uuid().optional(),
   newProduct: z.object({
     name: z.string().min(1),
@@ -88,14 +95,26 @@ const lineSchema = z.object({
   }).optional(),
   qty: z.number().positive(),
   unitPrice: z.number().min(0),
-}).refine((l) => l.productId || l.newProduct, { message: 'Provide either productId or newProduct' });
+}).refine((l) => l.productId || l.newProduct, { message: 'Provide either productId or newProduct for a product line' });
+
+// Service line: description + expense account
+const serviceLineSchema = z.object({
+  lineType: z.literal('service'),
+  description: z.string().min(1),
+  accountId: z.string().uuid(),   // expense/service account to debit
+  qty: z.number().positive().default(1),
+  unitPrice: z.number().min(0),
+});
+
+const lineSchema = z.discriminatedUnion('lineType', [productLineSchema, serviceLineSchema]);
 
 const purchaseSchema = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   invoiceNumber: z.string().optional(),
   pragyapanNumber: z.string().optional(),
   supplierId: z.string().uuid(),
-  lines: z.array(lineSchema).min(1, 'Add at least one product.'),
+  narration: z.string().optional(),
+  lines: z.array(lineSchema).min(1, 'Add at least one item.'),
   paidAmount: z.number().min(0).default(0),
   accountId: z.string().uuid().optional(),
 }).refine((b) => b.paidAmount <= 0 || !!b.accountId, { message: 'Choose which account the payment went from.' });
@@ -121,56 +140,120 @@ async function createPurchaseWithinTx(client, companyId, userId, body) {
 
   let subtotal = 0;
   const lineData = [];
+
   for (const line of body.lines) {
-    let product;
-    if (line.newProduct) {
-      const { rows } = await client.query(
-        `insert into products (company_id, name, purchase_price, sell_price, stock, min_stock, unit)
-         values ($1,$2,$3,$4,0,$5,$6) returning *`,
-        [companyId, line.newProduct.name, line.unitPrice, line.newProduct.sellPrice ?? line.unitPrice, line.newProduct.minStock, line.newProduct.unit]
+    if (line.lineType === 'service' || (!line.productId && !line.newProduct)) {
+      // ── Service line ───────────────────────────────────────────────────────
+      // Validate the account belongs to this company
+      const { rows: accs } = await client.query(
+        'select id, name from accounts where id=$1 and company_id=$2',
+        [line.accountId, companyId]
       );
-      product = rows[0];
+      if (!accs[0]) { const e = new Error(`Service account not found: ${line.accountId}`); e.status = 404; throw e; }
+      const lineTotal = (line.unitPrice || 0) * (line.qty || 1);
+      subtotal += lineTotal;
+      lineData.push({
+        type: 'service',
+        description: line.description,
+        accountId: line.accountId,
+        accountName: accs[0].name,
+        qty: line.qty || 1,
+        unitPrice: line.unitPrice || 0,
+        lineTotal,
+      });
     } else {
-      const { rows } = await client.query('select * from products where id=$1 and company_id=$2 for update', [line.productId, companyId]);
-      product = rows[0];
-      if (!product) { const e = new Error('Product not found'); e.status = 404; throw e; }
-      await client.query('update products set purchase_price=$1 where id=$2', [line.unitPrice, product.id]);
+      // ── Product line ───────────────────────────────────────────────────────
+      let product;
+      if (line.newProduct) {
+        const { rows } = await client.query(
+          `insert into products (company_id, name, purchase_price, sell_price, stock, min_stock, unit)
+           values ($1,$2,$3,$4,0,$5,$6) returning *`,
+          [companyId, line.newProduct.name, line.unitPrice, line.newProduct.sellPrice ?? line.unitPrice, line.newProduct.minStock, line.newProduct.unit]
+        );
+        product = rows[0];
+      } else {
+        const { rows } = await client.query('select * from products where id=$1 and company_id=$2 for update', [line.productId, companyId]);
+        product = rows[0];
+        if (!product) { const e = new Error('Product not found'); e.status = 404; throw e; }
+        await client.query('update products set purchase_price=$1 where id=$2', [line.unitPrice, product.id]);
+      }
+      const lineTotal = line.unitPrice * line.qty;
+      subtotal += lineTotal;
+      lineData.push({ type: 'product', product, qty: line.qty, unitPrice: line.unitPrice, unit: product.unit, lineTotal });
     }
-    const lineTotal = line.unitPrice * line.qty;
-    subtotal += lineTotal;
-    lineData.push({ product, qty: line.qty, unitPrice: line.unitPrice, unit: product.unit, lineTotal });
   }
+
   const total = Math.round(subtotal * 100) / 100;
 
+  // Update stock only for product lines
   for (const l of lineData) {
-    await client.query('update products set stock = stock + $1 where id = $2', [l.qty, l.product.id]);
+    if (l.type === 'product') {
+      await client.query('update products set stock = stock + $1 where id = $2', [l.qty, l.product.id]);
+    }
   }
 
   const date = body.date || await companyToday(client, companyId);
-  const invAcct = await heading(client, companyId, 'Inventory');
   const invoiceRef = (body.invoiceNumber ? ' — Invoice ' + body.invoiceNumber : '') + (body.pragyapanNumber ? ' — PP ' + body.pragyapanNumber : '');
+  const memoBase = `Purchase from ${supplier.name}${invoiceRef}`;
+  const memo = body.narration ? `${memoBase} — ${body.narration}` : memoBase;
 
-  const lines = [{ accountId: invAcct, debit: total, credit: 0 }, { accountId: supplier.account_id, debit: 0, credit: total }];
-  const entry = await postJournal(client, { companyId, date, memo: `Purchase from ${supplier.name}${invoiceRef}`, source: 'Purchase', reference: body.invoiceNumber, lines, createdBy: userId });
+  // Build journal lines:
+  // - Product lines: debit Inventory
+  // - Service lines: debit the chosen expense/service account
+  // - Credit full total to Supplier AP
+  const invAcct = await heading(client, companyId, 'Inventory');
+  const productSubtotal = lineData.filter((l) => l.type === 'product').reduce((s, l) => s + l.lineTotal, 0);
+  const journalLines = [];
+  if (productSubtotal > 0.004) {
+    journalLines.push({ accountId: invAcct, debit: Math.round(productSubtotal * 100) / 100, credit: 0 });
+  }
+  // Group service debits by account so we don't create duplicate lines for same account
+  const serviceByAccount = {};
+  for (const l of lineData) {
+    if (l.type === 'service') {
+      serviceByAccount[l.accountId] = (serviceByAccount[l.accountId] || 0) + l.lineTotal;
+    }
+  }
+  for (const [accId, amount] of Object.entries(serviceByAccount)) {
+    journalLines.push({ accountId: accId, debit: Math.round(amount * 100) / 100, credit: 0 });
+  }
+  journalLines.push({ accountId: supplier.account_id, debit: 0, credit: total });
+
+  const entry = await postJournal(client, {
+    companyId, date, memo, remark: body.narration || undefined,
+    source: 'Purchase', reference: body.invoiceNumber, lines: journalLines, createdBy: userId,
+  });
 
   const { rows } = await client.query(
     `insert into purchase_invoices
-       (company_id, invoice_number, pragyapan_number, supplier_id, subtotal, total, paid_amount, credit_amount, payment_account_id, journal_entry_id, date, created_by)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) returning *`,
-    [companyId, body.invoiceNumber || null, body.pragyapanNumber || null, body.supplierId, subtotal, total, 0, total, body.accountId || null, entry?.id || null, date, userId]
+       (company_id, invoice_number, pragyapan_number, supplier_id, subtotal, total, paid_amount, credit_amount,
+        payment_account_id, journal_entry_id, date, narration, created_by)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) returning *`,
+    [companyId, body.invoiceNumber || null, body.pragyapanNumber || null, body.supplierId,
+     subtotal, total, 0, total, body.accountId || null, entry?.id || null, date,
+     body.narration || null, userId]
   );
   const purchase = rows[0];
 
   for (const l of lineData) {
-    await client.query(
-      `insert into purchase_invoice_lines (purchase_invoice_id, product_id, unit, qty, unit_price, line_total) values ($1,$2,$3,$4,$5,$6)`,
-      [purchase.id, l.product.id, l.unit, l.qty, l.unitPrice, l.lineTotal]
-    );
+    if (l.type === 'product') {
+      await client.query(
+        `insert into purchase_invoice_lines
+           (purchase_invoice_id, product_id, line_type, unit, qty, unit_price, line_total)
+         values ($1,$2,'product',$3,$4,$5,$6)`,
+        [purchase.id, l.product.id, l.unit, l.qty, l.unitPrice, l.lineTotal]
+      );
+    } else {
+      await client.query(
+        `insert into purchase_invoice_lines
+           (purchase_invoice_id, line_type, description, account_id, unit, qty, unit_price, line_total)
+         values ($1,'service',$2,$3,'service',$4,$5,$6)`,
+        [purchase.id, l.description, l.accountId, l.qty, l.unitPrice, l.lineTotal]
+      );
+    }
   }
 
-  // Same principle as Sales: the invoice always posts its full amount to
-  // Accounts Payable; any amount paid up front is a separate, visible
-  // payment transaction against this specific bill.
+  // Upfront payment if any
   if (body.paidAmount > 0) {
     const applied = Math.min(body.paidAmount, total);
     await createPaymentWithinTx(client, companyId, userId, {
@@ -179,10 +262,14 @@ async function createPurchaseWithinTx(client, companyId, userId, body) {
     });
     purchase.paid_amount = applied;
     purchase.credit_amount = Math.round((total - applied) * 100) / 100;
-    await client.query('update purchase_invoices set paid_amount=$1, credit_amount=$2 where id=$3', [purchase.paid_amount, purchase.credit_amount, purchase.id]);
+    await client.query('update purchase_invoices set paid_amount=$1, credit_amount=$2 where id=$3',
+      [purchase.paid_amount, purchase.credit_amount, purchase.id]);
   }
 
-  purchase.lines = lineData.map((l) => ({ product_name: l.product.name, unit: l.unit, qty: l.qty, unit_price: l.unitPrice, line_total: l.lineTotal }));
+  purchase.lines = lineData.map((l) => l.type === 'product'
+    ? { line_type: 'product', product_name: l.product.name, unit: l.unit, qty: l.qty, unit_price: l.unitPrice, line_total: l.lineTotal }
+    : { line_type: 'service', description: l.description, account_name: l.accountName, unit: 'service', qty: l.qty, unit_price: l.unitPrice, line_total: l.lineTotal }
+  );
   return purchase;
 }
 
