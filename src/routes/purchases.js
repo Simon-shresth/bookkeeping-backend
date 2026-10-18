@@ -83,9 +83,12 @@ router.get('/', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// Product line: productId or newProduct
-const productLineSchema = z.object({
-  lineType: z.literal('product').default('product'),
+// A purchase line can be either a product (with productId or newProduct)
+// or a service (with description + accountId). lineType defaults to 'product'
+// for backward compatibility with clients that don't send it.
+const lineSchema = z.object({
+  lineType: z.enum(['product', 'service']).default('product'),
+  // product fields
   productId: z.string().uuid().optional(),
   newProduct: z.object({
     name: z.string().min(1),
@@ -93,35 +96,26 @@ const productLineSchema = z.object({
     minStock: z.number().min(0).default(0),
     unit: z.string().min(1).default('pcs'),
   }).optional(),
-  qty: z.number().positive(),
-  unitPrice: z.number().min(0),
-}).refine((l) => l.productId || l.newProduct, { message: 'Provide either productId or newProduct for a product line' });
-
-// Service line: description + expense account
-const serviceLineSchema = z.object({
-  lineType: z.literal('service'),
-  description: z.string().min(1),
-  accountId: z.string().uuid(),   // expense/service account to debit
+  // service fields
+  description: z.string().optional(),
+  accountId: z.string().uuid().optional(),
+  // common
   qty: z.number().positive().default(1),
   unitPrice: z.number().min(0),
+}).superRefine((l, ctx) => {
+  if (l.lineType === 'service') {
+    if (!l.description || l.description.trim() === '') {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Service lines require a description', path: ['description'] });
+    }
+    if (!l.accountId) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Service lines require an expense account', path: ['accountId'] });
+    }
+  } else {
+    if (!l.productId && !l.newProduct) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Product lines require either productId or newProduct', path: ['productId'] });
+    }
+  }
 });
-
-const lineSchema = z.discriminatedUnion('lineType', [productLineSchema, serviceLineSchema])
-  .or(
-    // Backward compat: lines without lineType are treated as product lines
-    z.object({
-      productId: z.string().uuid().optional(),
-      newProduct: z.object({
-        name: z.string().min(1),
-        sellPrice: z.number().min(0).optional(),
-        minStock: z.number().min(0).default(0),
-        unit: z.string().min(1).default('pcs'),
-      }).optional(),
-      qty: z.number().positive(),
-      unitPrice: z.number().min(0),
-    }).transform((l) => ({ ...l, lineType: 'product' }))
-      .refine((l) => l.productId || l.newProduct, { message: 'Provide either productId or newProduct' })
-  );
 
 const purchaseSchema = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
