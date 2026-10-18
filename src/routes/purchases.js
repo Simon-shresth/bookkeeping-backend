@@ -106,7 +106,22 @@ const serviceLineSchema = z.object({
   unitPrice: z.number().min(0),
 });
 
-const lineSchema = z.discriminatedUnion('lineType', [productLineSchema, serviceLineSchema]);
+const lineSchema = z.discriminatedUnion('lineType', [productLineSchema, serviceLineSchema])
+  .or(
+    // Backward compat: lines without lineType are treated as product lines
+    z.object({
+      productId: z.string().uuid().optional(),
+      newProduct: z.object({
+        name: z.string().min(1),
+        sellPrice: z.number().min(0).optional(),
+        minStock: z.number().min(0).default(0),
+        unit: z.string().min(1).default('pcs'),
+      }).optional(),
+      qty: z.number().positive(),
+      unitPrice: z.number().min(0),
+    }).transform((l) => ({ ...l, lineType: 'product' }))
+      .refine((l) => l.productId || l.newProduct, { message: 'Provide either productId or newProduct' })
+  );
 
 const purchaseSchema = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
