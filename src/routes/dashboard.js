@@ -29,9 +29,9 @@ router.get('/', async (req, res, next) => {
       // Fetch all loans for this company with their account metadata
       pool.query(
         `select l.id, l.lender_name, l.principal, l.interest_rate, l.start_date::text as start_date,
-                a.id as account_id, a.name as account_name
+                l.account_id, coalesce(a.name, 'Loan Account') as account_name
          from loans l
-         join accounts a on a.id = l.account_id
+         left join accounts a on a.id = l.account_id
          where l.company_id = $1
          order by l.start_date asc`,
         [companyId]
@@ -41,7 +41,8 @@ router.get('/', async (req, res, next) => {
     // Compute current outstanding balance per loan from the ledger
     const today = Date.now();
     const loanAgeing = await Promise.all(loanRows.map(async (loan) => {
-      const balance = await getAccountBalance(companyId, loan.account_id);
+      // Use left join for account; compute balance only if account exists
+      const balance = loan.account_id ? await getAccountBalance(companyId, loan.account_id) : 0;
       // balance for a Liability account is positive when money is owed
       const daysSinceStart = loan.start_date
         ? Math.floor((today - new Date(loan.start_date).getTime()) / 86400000)

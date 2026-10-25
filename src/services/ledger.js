@@ -238,7 +238,7 @@ async function getTotalsForPeriod(companyId, from, till) {
     params
   );
 
-  let revenue = 0, cogs = 0, expenseTotal = 0, ar = 0, ap = 0;
+  let revenue = 0, cogs = 0, expenseTotal = 0;
   for (const r of rows) {
     const bal = isDebitNormal(r.category)
       ? Number(r.debit) - Number(r.credit)
@@ -246,10 +246,41 @@ async function getTotalsForPeriod(companyId, from, till) {
     if (r.category === 'Income') revenue += bal;
     else if (r.category === 'Expenses' && r.heading === 'Cost of Goods Sold') cogs += bal;
     else if (r.category === 'Expenses') expenseTotal += bal;
-    else if (r.category === 'Assets' && r.heading === 'Accounts Receivable') ar += bal;
-    else if (r.category === 'Liabilities' && r.heading === 'Accounts Payable') ap += bal;
   }
-  return { revenue, cogs, expenseTotal, ar, ap, profit: revenue - cogs - expenseTotal };
+
+  // Compute AR/AP balances as of the date range's end (or latest date)
+  // by summing the outstanding balances of all Accounts Receivable/Payable
+  // accounts. Use till as the effective cutoff date for the period's balance.
+  const reportDate = till || from || new Date().toISOString().split('T')[0];
+  const { rows: arRows } = await pool.query(
+    `select coalesce(sum(jl.debit), 0) as debit, coalesce(sum(jl.credit), 0) as credit
+     from accounts a
+     left join journal_lines jl on jl.account_id = a.id
+     left join journal_entries je on je.id = jl.journal_entry_id
+     where a.company_id = $1
+       and a.category = 'Assets'
+       and a.heading = 'Accounts Receivable'
+       and je.date <= $2
+     group by a.id`,
+    [companyId, reportDate]
+  );
+  const arBalance = arRows.reduce((sum, r) => sum + (isDebitNormal('Assets') ? Number(r.debit) - Number(r.credit) : Number(r.credit) - Number(r.debit)), 0);
+
+  const { rows: apRows } = await pool.query(
+    `select coalesce(sum(jl.debit), 0) as debit, coalesce(sum(jl.credit), 0) as credit
+     from accounts a
+     left join journal_lines jl on jl.account_id = a.id
+     left join journal_entries je on je.id = jl.journal_entry_id
+     where a.company_id = $1
+       and a.category = 'Liabilities'
+       and a.heading = 'Accounts Payable'
+       and je.date <= $2
+     group by a.id`,
+    [companyId, reportDate]
+  );
+  const apBalance = apRows.reduce((sum, r) => sum + (isDebitNormal('Liabilities') ? Number(r.debit) - Number(r.credit) : Number(r.credit) - Number(r.debit)), 0);
+
+  return { revenue, cogs, expenseTotal, ar: arBalance, ap: apBalance, profit: revenue - cogs - expenseTotal };
 }
 
 // Returns the company's current open fiscal year, or null if none exists.
