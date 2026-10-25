@@ -39,7 +39,7 @@ router.get('/', async (req, res, next) => {
                 coalesce(sum(case when je.date >= fd.first_date then jl.debit else 0 end),0) as debit,
                 coalesce(sum(case when je.date >= fd.first_date then jl.credit else 0 end),0) as credit,
                 fd.first_date as taken_date,
-                (array_agg(je.memo ORDER BY je.created_at) FILTER (WHERE je.memo IS NOT NULL AND fd.first_date IS NOT NULL) LIMIT 1) as memo
+                (array_agg(je.memo ORDER BY je.created_at) FILTER (WHERE je.memo IS NOT NULL)) [1] as memo
          from accounts a
          left join first_date fd on fd.account_id = a.id
          left join journal_lines jl on jl.account_id = a.id
