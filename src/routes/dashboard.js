@@ -26,12 +26,11 @@ router.get('/', async (req, res, next) => {
          order by date desc limit 8`,
         [companyId]
       ),
-      // Fetch all loans for this company with their account metadata
+      // Fetch all loans for this company — do not require account join
       pool.query(
         `select l.id, l.lender_name, l.principal, l.interest_rate, l.start_date::text as start_date,
-                l.account_id, coalesce(a.name, 'Loan Account') as account_name
+                l.account_id
          from loans l
-         left join accounts a on a.id = l.account_id
          where l.company_id = $1
          order by l.start_date asc`,
         [companyId]
@@ -41,8 +40,16 @@ router.get('/', async (req, res, next) => {
     // Compute current outstanding balance per loan from the ledger
     const today = Date.now();
     const loanAgeing = await Promise.all(loanRows.map(async (loan) => {
-      // Use left join for account; compute balance only if account exists
-      const balance = loan.account_id ? await getAccountBalance(companyId, loan.account_id) : 0;
+      // Resolve account name if account exists, else use lender / generic
+      let accountName = loan.lender_name || 'Loan';
+      let accountId = loan.account_id;
+      if (loan.account_id) {
+        try {
+          const accRes = await pool.query('select name from accounts where id = $1', [loan.account_id]);
+          if (accRes.rows[0]) accountName = accRes.rows[0].name;
+        } catch (e) { /* ignore */ }
+      }
+      const balance = accountId ? await getAccountBalance(companyId, accountId) : 0;
       // balance for a Liability account is positive when money is owed
       const daysSinceStart = loan.start_date
         ? Math.floor((today - new Date(loan.start_date).getTime()) / 86400000)
@@ -54,8 +61,8 @@ router.get('/', async (req, res, next) => {
         : '1+ years';
       return {
         id: loan.id,
-        lender_name: loan.lender_name || loan.account_name,
-        account_name: loan.account_name,
+        lender_name: loan.lender_name || accountName,
+        account_name: accountName,
         principal: Number(loan.principal) || null,
         interest_rate: loan.interest_rate != null ? Number(loan.interest_rate) : null,
         start_date: loan.start_date,
