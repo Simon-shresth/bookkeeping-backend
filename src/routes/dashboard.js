@@ -26,33 +26,41 @@ router.get('/', async (req, res, next) => {
          order by date desc limit 8`,
         [companyId]
       ),
-      // Fetch all loans for this company — do not require account join
+      // Fetch accounts with heading 'Loans', compute balance up to now,
+      // and get first journal entry date/memo (when taken)
       pool.query(
-        `select l.id, l.lender_name, l.principal, l.interest_rate, l.start_date::text as start_date,
-                l.account_id
-         from loans l
-         where l.company_id = $1
-         order by l.start_date asc`,
+        `with first_date as (
+           select account_id, min(date) as first_date
+           from journal_lines jl join journal_entries je on je.id = jl.journal_entry_id
+           where je.company_id = $1
+           group by account_id
+         )
+         select a.id as account_id, a.name as account_name,
+                coalesce(sum(case when je.date >= fd.first_date then jl.debit else 0 end),0) as debit,
+                coalesce(sum(case when je.date >= fd.first_date then jl.credit else 0 end),0) as credit,
+                fd.first_date as taken_date,
+                (array_agg(je.memo ORDER BY je.created_at) FILTER (WHERE je.memo IS NOT NULL AND fd.first_date IS NOT NULL) LIMIT 1) as memo
+         from accounts a
+         left join first_date fd on fd.account_id = a.id
+         left join journal_lines jl on jl.account_id = a.id
+         left join journal_entries je on je.id = jl.journal_entry_id and je.company_id = $1
+         where a.company_id = $1 and a.heading = 'Loans'
+         group by a.id, a.name, fd.first_date
+         order by a.name`,
         [companyId]
       ),
     ]);
 
-    // Compute current outstanding balance per loan from the ledger
+    // Compute current outstanding balance per loan account from its journal
     const today = Date.now();
     const loanAgeing = await Promise.all(loanRows.map(async (loan) => {
-      // Resolve account name if account exists, else use lender / generic
-      let accountName = loan.lender_name || 'Loan';
-      let accountId = loan.account_id;
-      if (loan.account_id) {
-        try {
-          const accRes = await pool.query('select name from accounts where id = $1', [loan.account_id]);
-          if (accRes.rows[0]) accountName = accRes.rows[0].name;
-        } catch (e) { /* ignore */ }
-      }
-      const balance = accountId ? await getAccountBalance(companyId, accountId) : 0;
-      // balance for a Liability account is positive when money is owed
-      const daysSinceStart = loan.start_date
-        ? Math.floor((today - new Date(loan.start_date).getTime()) / 86400000)
+      const debit = Number(loan.debit || 0);
+      const credit = Number(loan.credit || 0);
+      // Liabilities (Loans) are credit-normal: balance = credit - debit (positive = owed)
+      const balance = credit - debit;
+      const takenDateStr = loan.taken_date ? new Date(loan.taken_date).toISOString().split('T')[0] : null;
+      const daysSinceStart = takenDateStr
+        ? Math.floor((today - new Date(takenDateStr).getTime()) / 86400000)
         : null;
       const bucket = daysSinceStart == null ? 'Unknown'
         : daysSinceStart <= 90 ? '0-90 days'
@@ -60,12 +68,10 @@ router.get('/', async (req, res, next) => {
         : daysSinceStart <= 365 ? '181-365 days'
         : '1+ years';
       return {
-        id: loan.id,
-        lender_name: loan.lender_name || accountName,
-        account_name: accountName,
-        principal: Number(loan.principal) || null,
-        interest_rate: loan.interest_rate != null ? Number(loan.interest_rate) : null,
-        start_date: loan.start_date,
+        id: loan.account_id,
+        account_name: loan.account_name || 'Unknown Loan',
+        taken_date: takenDateStr,
+        memo: loan.memo || null,
         balance,
         days_outstanding: daysSinceStart,
         bucket,
