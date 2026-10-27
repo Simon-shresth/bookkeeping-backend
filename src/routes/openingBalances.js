@@ -197,7 +197,7 @@ router.post('/bulk-import', requireRole('accountant'), upload.single('file'), as
         const text = req.file.buffer.toString('utf-8');
         const lines = text.trim().split('\n');
         rows = lines.slice(1).map((line) => {
-          const parts = line.split(',').map(p => p.trim());
+          const parts = line.split(',').map(p => p.trim().replace(/^["']|["']$/g, ''));
           return {
             accountName: parts[0],
             heading: parts[1],
@@ -211,17 +211,28 @@ router.post('/bulk-import', requireRole('accountant'), upload.single('file'), as
         const sheet = workbook.Sheets[workbook.SheetNames[0]];
         const data = XLSX.utils.sheet_to_json(sheet);
         rows = data
-          .map((row) => ({
-            accountName: row['Account Name'] || row['account_name'],
-            heading: row['Heading'] || row['heading'],
-            amount: parseFloat(row['Amount'] || row['amount']),
-            date: row['Date'] || row['date'],
-          }))
+          .map((row) => {
+            // Handle Excel date serial numbers
+            let dateStr = row['Date'] || row['date'];
+            if (typeof dateStr === 'number') {
+              // Excel date serial to JS date
+              const excelEpoch = new Date(1899, 11, 30);
+              const jsDate = new Date(excelEpoch.getTime() + dateStr * 86400000);
+              dateStr = jsDate.toISOString().split('T')[0];
+            }
+            return {
+              accountName: row['Account Name'] || row['account_name'],
+              heading: row['Heading'] || row['heading'],
+              amount: parseFloat(row['Amount'] || row['amount']),
+              date: dateStr,
+            };
+          })
           .filter(r => r.accountName && r.heading && !isNaN(r.amount) && r.date);
       } else {
         return res.status(400).json({ error: 'Unsupported file format. Use CSV or XLSX.' });
       }
     } catch (parseErr) {
+      console.error('File parse error:', parseErr);
       return res.status(400).json({ error: `Failed to parse file: ${parseErr.message}` });
     }
 
@@ -234,8 +245,8 @@ router.post('/bulk-import', requireRole('accountant'), upload.single('file'), as
     const errors = [];
 
     for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
       try {
-        const row = rows[i];
         const result = await withTransaction(async (client) => {
           // Find category for this heading
           let category = null;
@@ -361,12 +372,14 @@ router.post('/bulk-import', requireRole('accountant'), upload.single('file'), as
         });
         results.push(result);
       } catch (err) {
+        console.error(`Error processing row ${i + 2}:`, err);
         errors.push({ row: i + 2, accountName: row.accountName, error: err.message });
       }
     }
 
     res.json({ imported: results.length, errors, results });
   } catch (err) {
+    console.error('Bulk import error:', err);
     if (err.status) return res.status(err.status).json({ error: err.message });
     next(err);
   }
