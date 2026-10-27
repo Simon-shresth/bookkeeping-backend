@@ -287,6 +287,7 @@ router.post('/bulk-import', requireRole('accountant'), upload.single('file'), as
             );
 
             let accountId;
+            let isNewAccount = false;
             if (existing[0]) {
               accountId = existing[0].id;
             } else {
@@ -296,6 +297,23 @@ router.post('/bulk-import', requireRole('accountant'), upload.single('file'), as
                 [companyId, row.accountName, row.heading, category]
               );
               accountId = created[0].id;
+              isNewAccount = true;
+            }
+
+            // If new account under Accounts Receivable, also create Customer
+            if (isNewAccount && row.heading === 'Accounts Receivable') {
+              await client.query(
+                'insert into customers (company_id, name, contact, account_id) values ($1,$2,$3,$4)',
+                [companyId, row.accountName, null, accountId]
+              );
+            }
+
+            // If new account under Accounts Payable, also create Supplier
+            if (isNewAccount && row.heading === 'Accounts Payable') {
+              await client.query(
+                'insert into suppliers (company_id, name, contact, account_id) values ($1,$2,$3,$4)',
+                [companyId, row.accountName, null, accountId]
+              );
             }
 
             // Reverse any previous opening balance for this account
