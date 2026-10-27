@@ -335,6 +335,7 @@ router.post('/bulk-import', requireRole('accountant'), upload.single('file'), as
                 'insert into customers (company_id, name, contact, account_id) values ($1,$2,$3,$4)',
                 [companyId, row.accountName, null, accountId]
               );
+              console.log(`Created Customer for account: ${row.accountName}`);
             }
 
             // If new account under Accounts Payable, also create Supplier
@@ -343,6 +344,7 @@ router.post('/bulk-import', requireRole('accountant'), upload.single('file'), as
                 'insert into suppliers (company_id, name, contact, account_id) values ($1,$2,$3,$4)',
                 [companyId, row.accountName, null, accountId]
               );
+              console.log(`Created Supplier for account: ${row.accountName}`);
             }
 
             // Reverse any previous opening balance for this account
