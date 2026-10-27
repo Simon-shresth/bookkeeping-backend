@@ -382,7 +382,8 @@ router.post('/bulk-import', requireRole('accountant'), upload.single('file'), as
             results.push({ accountName: row.accountName, amount, status: 'imported' });
           } catch (err) {
             console.error(`Error processing row ${i + 2}:`, err);
-            errors.push({ row: i + 2, accountName: row.accountName, error: err.message });
+            // Throw to abort entire transaction — user must fix all errors
+            throw new Error(`Row ${i + 2} (${row.accountName || 'unknown'}): ${err.message}`);
           }
         }
       });
@@ -391,7 +392,12 @@ router.post('/bulk-import', requireRole('accountant'), upload.single('file'), as
       return res.status(400).json({ error: `Failed to process file: ${err.message}` });
     }
 
-    res.json({ imported: results.length, errors, results });
+    // If there were errors, return 400 so frontend shows the error
+    if (errors.length > 0) {
+      return res.status(400).json({ error: errors[0].error });
+    }
+
+    res.json({ imported: results.length, errors: [], results });
   } catch (err) {
     console.error('Bulk import error:', err);
     if (err.status) return res.status(err.status).json({ error: err.message });
