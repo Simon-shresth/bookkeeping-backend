@@ -111,7 +111,7 @@ async function getHeadingBalance(companyId, heading) {
 // introduced — the column exists so that feature can be added later
 // without changing the shape of this response).
 async function getAccountLedger(companyId, accountId, { from, till } = {}) {
-  const accRes = await pool.query('select id, name, heading, category from accounts where id = $1 and company_id = $2', [accountId, companyId]);
+  const accRes = await pool.query('select id, name, heading, category, is_system from accounts where id = $1 and company_id = $2', [accountId, companyId]);
   const account = accRes.rows[0];
   if (!account) return null;
   const debitNormal = isDebitNormal(account.category);
