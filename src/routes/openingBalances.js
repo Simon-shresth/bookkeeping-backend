@@ -211,32 +211,44 @@ router.post('/bulk-import', requireRole('accountant'), upload.single('file'), as
         const sheet = workbook.Sheets[workbook.SheetNames[0]];
         const data = XLSX.utils.sheet_to_json(sheet);
 
-        console.log('First row from XLSX:', JSON.stringify(data[0], null, 2));
-        console.log('XLSX column keys:', data.length > 0 ? Object.keys(data[0]) : 'no rows');
+        // Helper: try to match columns by header name (case-insensitive, space-tolerant)
+        // Fallback: assume first 4 columns in order: Account Name, Heading, Amount, Date
+        const getCol = (row, ...keys) => {
+          for (const k of keys) {
+            const lower = k.toLowerCase().trim();
+            for (const [key, val] of Object.entries(row)) {
+              if (key.toLowerCase().trim().replace(/\s+/g, '') === lower.replace(/\s+/g, '')) {
+                return val;
+              }
+            }
+          }
+          return undefined;
+        };
 
         rows = data
           .map((row) => {
-            // Normalize keys: XLSX may have different casing or spaces
-            // Create a normalized lookup object (case-insensitive, whitespace-tolerant)
-            const normalized = {};
-            Object.entries(row).forEach(([key, val]) => {
-              const normalizedKey = key.toLowerCase().trim();
-              normalized[normalizedKey] = val;
-            });
+            // Try named columns first; fall back to positional (col 1,2,3,4)
+            const keys = Object.keys(row);
+            const accountName = getCol(row, 'account name', 'account_name', 'account') ?? (keys[0] ? row[keys[0]] : undefined);
+            const headingRaw = getCol(row, 'heading') ?? (keys[1] ? row[keys[1]] : undefined);
+            const amountRaw = getCol(row, 'amount') ?? (keys[2] ? row[keys[2]] : undefined);
+            const dateRaw = getCol(row, 'date') ?? (keys[3] ? row[keys[3]] : undefined);
 
             // Handle Excel date serial numbers
-            let dateStr = normalized['date'];
+            let dateStr = dateRaw;
             if (typeof dateStr === 'number') {
-              // Excel date serial to JS date
               const excelEpoch = new Date(1899, 11, 30);
               const jsDate = new Date(excelEpoch.getTime() + dateStr * 86400000);
               dateStr = jsDate.toISOString().split('T')[0];
             }
 
+            // Normalize heading value for case-insensitive comparison
+            const heading = typeof headingRaw === 'string' ? headingRaw.trim() : String(headingRaw || '');
+
             return {
-              accountName: normalized['account name'],
-              heading: normalized['heading'],
-              amount: parseFloat(normalized['amount']),
+              accountName: typeof accountName === 'string' ? accountName.trim() : String(accountName || ''),
+              heading: heading,
+              amount: parseFloat(amountRaw),
               date: String(dateStr || ''),
             };
           })
@@ -276,11 +288,15 @@ router.post('/bulk-import', requireRole('accountant'), upload.single('file'), as
           const row = rows[i];
           console.log(`Processing row ${i + 1}:`, row);
           try {
-            // Find category for this heading
+            // Find category for this heading (case-insensitive match against DEFAULT_HEADINGS)
             let category = null;
+            const headingTrimmed = row.heading.trim();
             for (const [cat, headings] of Object.entries(DEFAULT_HEADINGS)) {
-              if (headings.includes(row.heading)) {
+              const match = headings.find(h => h.toLowerCase() === headingTrimmed.toLowerCase());
+              if (match) {
                 category = cat;
+                // Use the canonical heading from DEFAULT_HEADINGS for storage
+                row.heading = match;
                 break;
               }
             }
