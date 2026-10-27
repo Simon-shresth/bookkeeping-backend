@@ -319,6 +319,7 @@ router.post('/bulk-import', requireRole('accountant'), upload.single('file'), as
             let isNewAccount = false;
             if (existing[0]) {
               accountId = existing[0].id;
+              console.log(`Account "${row.accountName}" already exists (id: ${accountId})`);
             } else {
               // Create new account
               const { rows: created } = await client.query(
@@ -327,24 +328,41 @@ router.post('/bulk-import', requireRole('accountant'), upload.single('file'), as
               );
               accountId = created[0].id;
               isNewAccount = true;
+              console.log(`Created new account "${row.accountName}" (id: ${accountId}, heading: ${row.heading})`);
             }
 
-            // If new account under Accounts Receivable, also create Customer
-            if (isNewAccount && row.heading === 'Accounts Receivable') {
-              await client.query(
-                'insert into customers (company_id, name, contact, account_id) values ($1,$2,$3,$4)',
-                [companyId, row.accountName, null, accountId]
+            // If account under Accounts Receivable, ensure Customer exists (create if missing)
+            if (row.heading === 'Accounts Receivable') {
+              const { rows: existingCustomer } = await client.query(
+                'select id from customers where company_id=$1 and account_id=$2',
+                [companyId, accountId]
               );
-              console.log(`Created Customer for account: ${row.accountName}`);
+              if (!existingCustomer[0]) {
+                const { rows: customerRow } = await client.query(
+                  'insert into customers (company_id, name, contact, account_id) values ($1,$2,$3,$4) returning id',
+                  [companyId, row.accountName, null, accountId]
+                );
+                console.log(`✓ Created Customer (id: ${customerRow[0].id}) for account: ${row.accountName}`);
+              } else {
+                console.log(`Customer already exists for account: ${row.accountName}`);
+              }
             }
 
-            // If new account under Accounts Payable, also create Supplier
-            if (isNewAccount && row.heading === 'Accounts Payable') {
-              await client.query(
-                'insert into suppliers (company_id, name, contact, account_id) values ($1,$2,$3,$4)',
-                [companyId, row.accountName, null, accountId]
+            // If account under Accounts Payable, ensure Supplier exists (create if missing)
+            if (row.heading === 'Accounts Payable') {
+              const { rows: existingSupplier } = await client.query(
+                'select id from suppliers where company_id=$1 and account_id=$2',
+                [companyId, accountId]
               );
-              console.log(`Created Supplier for account: ${row.accountName}`);
+              if (!existingSupplier[0]) {
+                const { rows: supplierRow } = await client.query(
+                  'insert into suppliers (company_id, name, contact, account_id) values ($1,$2,$3,$4) returning id',
+                  [companyId, row.accountName, null, accountId]
+                );
+                console.log(`✓ Created Supplier (id: ${supplierRow[0].id}) for account: ${row.accountName}`);
+              } else {
+                console.log(`Supplier already exists for account: ${row.accountName}`);
+              }
             }
 
             // Reverse any previous opening balance for this account
