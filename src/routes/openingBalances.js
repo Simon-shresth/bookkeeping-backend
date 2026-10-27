@@ -1,11 +1,14 @@
 const express = require('express');
 const { z } = require('zod');
+const multer = require('multer');
+const XLSX = require('xlsx');
 const { pool, withTransaction } = require('../db');
 const { requireRole } = require('../auth');
-const { postJournal, reverseJournalEntry } = require('../services/ledger');
+const { postJournal, reverseJournalEntry, DEFAULT_HEADINGS } = require('../services/ledger');
 const { audit } = require('../services/audit');
 
 const router = express.Router();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 // GET /api/opening-balances — list all opening balances for the company
 router.get('/', async (req, res, next) => {
@@ -172,6 +175,209 @@ router.delete('/:accountId', requireRole('accountant'), async (req, res, next) =
     if (err.status) return res.status(err.status).json({ error: err.message });
     next(err);
   }
+});
+
+// POST /api/opening-balances/bulk-import — import opening balances from CSV/Excel file
+// Format: Account Name, Heading, Amount, Date
+// If account doesn't exist, creates it under the appropriate category based on heading.
+router.post('/bulk-import', requireRole('accountant'), upload.single('file'), async (req, res, next) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const companyId = req.user.company_id;
+    const fileExt = req.file.originalname.split('.').pop().toLowerCase();
+
+    // Parse file based on extension
+    let rows = [];
+    try {
+      if (fileExt === 'csv') {
+        // Simple CSV parser
+        const text = req.file.buffer.toString('utf-8');
+        const lines = text.trim().split('\n');
+        rows = lines.slice(1).map((line) => {
+          const parts = line.split(',').map(p => p.trim());
+          return {
+            accountName: parts[0],
+            heading: parts[1],
+            amount: parseFloat(parts[2]),
+            date: parts[3],
+          };
+        }).filter(r => r.accountName && r.heading && !isNaN(r.amount) && r.date);
+      } else if (fileExt === 'xlsx' || fileExt === 'xls') {
+        // Parse Excel
+        const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const data = XLSX.utils.sheet_to_json(sheet);
+        rows = data
+          .map((row) => ({
+            accountName: row['Account Name'] || row['account_name'],
+            heading: row['Heading'] || row['heading'],
+            amount: parseFloat(row['Amount'] || row['amount']),
+            date: row['Date'] || row['date'],
+          }))
+          .filter(r => r.accountName && r.heading && !isNaN(r.amount) && r.date);
+      } else {
+        return res.status(400).json({ error: 'Unsupported file format. Use CSV or XLSX.' });
+      }
+    } catch (parseErr) {
+      return res.status(400).json({ error: `Failed to parse file: ${parseErr.message}` });
+    }
+
+    if (rows.length === 0) {
+      return res.status(400).json({ error: 'No valid data rows found. Check file format.' });
+    }
+
+    // Process each row in a transaction
+    const results = [];
+    const errors = [];
+
+    for (let i = 0; i < rows.length; i++) {
+      try {
+        const row = rows[i];
+        const result = await withTransaction(async (client) => {
+          // Find category for this heading
+          let category = null;
+          for (const [cat, headings] of Object.entries(DEFAULT_HEADINGS)) {
+            if (headings.includes(row.heading)) {
+              category = cat;
+              break;
+            }
+          }
+          if (!category) {
+            throw new Error(`Unknown heading: ${row.heading}`);
+          }
+
+          // Find or create account
+          let { rows: existing } = await client.query(
+            'select id, name, category from accounts where company_id=$1 and name=$2',
+            [companyId, row.accountName]
+          );
+
+          let accountId;
+          if (existing[0]) {
+            accountId = existing[0].id;
+          } else {
+            // Create new account
+            const { rows: created } = await client.query(
+              'insert into accounts (company_id, name, heading, category, is_system) values ($1,$2,$3,$4,false) returning id',
+              [companyId, row.accountName, row.heading, category]
+            );
+            accountId = created[0].id;
+          }
+
+          // Find Retained Earnings for balancing
+          const { rows: eq } = await client.query(
+            "select id from accounts where company_id=$1 and heading='Retained Earnings' and is_system=true limit 1",
+            [companyId]
+          );
+          if (!eq[0]) {
+            throw new Error('Retained Earnings account not found — run company setup first.');
+          }
+          const equityId = eq[0].id;
+
+          // Reverse any previous opening balance for this account
+          const { rows: prevOb } = await client.query(
+            'select * from opening_balances where company_id=$1 and account_id=$2',
+            [companyId, accountId]
+          );
+          if (prevOb[0]?.journal_entry_id) {
+            await reverseJournalEntry(client, prevOb[0].journal_entry_id);
+          }
+
+          const amount = row.amount;
+          if (Math.abs(amount) < 0.005) {
+            // Delete if zero
+            await client.query(
+              'delete from opening_balances where company_id=$1 and account_id=$2',
+              [companyId, accountId]
+            );
+            return { accountName: row.accountName, amount, status: 'skipped (zero)' };
+          }
+
+          // Build journal lines
+          const { isDebitNormal } = require('../services/ledger');
+          const debitNormal = isDebitNormal(category);
+          const absAmount = Math.abs(amount);
+          const isPositive = amount > 0;
+
+          let lines;
+          if (debitNormal) {
+            if (isPositive) {
+              lines = [
+                { accountId, debit: absAmount, credit: 0 },
+                { accountId: equityId, debit: 0, credit: absAmount },
+              ];
+            } else {
+              lines = [
+                { accountId: equityId, debit: absAmount, credit: 0 },
+                { accountId, debit: 0, credit: absAmount },
+              ];
+            }
+          } else {
+            if (isPositive) {
+              lines = [
+                { accountId: equityId, debit: absAmount, credit: 0 },
+                { accountId, debit: 0, credit: absAmount },
+              ];
+            } else {
+              lines = [
+                { accountId, debit: absAmount, credit: 0 },
+                { accountId: equityId, debit: 0, credit: absAmount },
+              ];
+            }
+          }
+
+          const entry = await postJournal(client, {
+            companyId,
+            date: row.date,
+            memo: `Opening balance — ${row.accountName}`,
+            source: 'Opening Balance Bulk Import',
+            lines,
+            createdBy: req.user.id,
+          });
+
+          // Upsert opening_balances record
+          const { rows: ob } = await client.query(
+            `insert into opening_balances (company_id, account_id, amount, date, journal_entry_id, created_by)
+             values ($1,$2,$3,$4,$5,$6)
+             on conflict (company_id, account_id)
+             do update set amount=$3, date=$4, journal_entry_id=$5, created_by=$6
+             returning *`,
+            [companyId, accountId, amount, row.date, entry?.id || null, req.user.id]
+          );
+
+          await audit(client, {
+            companyId,
+            userId: req.user.id,
+            action: prevOb[0] ? 'update' : 'create',
+            entity: 'opening_balance',
+            entityId: ob[0].id,
+            details: { accountId, accountName: row.accountName, amount, date: row.date, source: 'bulk_import' },
+          });
+
+          return { accountName: row.accountName, amount, status: 'imported' };
+        });
+        results.push(result);
+      } catch (err) {
+        errors.push({ row: i + 2, accountName: row.accountName, error: err.message });
+      }
+    }
+
+    res.json({ imported: results.length, errors, results });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+// GET /api/opening-balances/template — download a template CSV file
+router.get('/template', (req, res) => {
+  const template = 'Account Name,Heading,Amount,Date\nCash,Cash,10000.00,2026-01-01\nBank Account,Bank,50000.00,2026-01-01\nLoan,Loans,-30000.00,2026-01-01\nOwner Capital,Owner\'s Capital,-30000.00,2026-01-01';
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="opening-balances-template.csv"');
+  res.send(template);
 });
 
 module.exports = router;

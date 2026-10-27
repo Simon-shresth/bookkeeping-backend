@@ -1,7 +1,7 @@
 {
   "name": "bookkeeping-backend",
   "version": "1.0.0",
-  "description": "REST API for the bookkeeping system \u2014 double-entry ledger, sales/purchases/expenses, reports.",
+  "description": "REST API for the bookkeeping system — double-entry ledger, sales/purchases/expenses, reports.",
   "main": "src/server.js",
   "type": "commonjs",
   "scripts": {
@@ -20,8 +20,10 @@
     "express-rate-limit": "^7.4.0",
     "helmet": "^7.1.0",
     "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
     "pdf-lib": "^1.17.1",
     "pg": "^8.12.0",
+    "xlsx": "^0.18.5",
     "zod": "^3.23.8"
   },
   "engines": {
