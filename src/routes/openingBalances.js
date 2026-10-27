@@ -240,141 +240,155 @@ router.post('/bulk-import', requireRole('accountant'), upload.single('file'), as
       return res.status(400).json({ error: 'No valid data rows found. Check file format.' });
     }
 
-    // Process each row in a transaction
+    console.log(`Bulk import: Processing ${rows.length} rows for company ${companyId}`);
+    console.log('Parsed rows:', JSON.stringify(rows, null, 2));
+
+    // Process all rows in a single transaction for atomicity
     const results = [];
     const errors = [];
 
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i];
-      try {
-        const result = await withTransaction(async (client) => {
-          // Find category for this heading
-          let category = null;
-          for (const [cat, headings] of Object.entries(DEFAULT_HEADINGS)) {
-            if (headings.includes(row.heading)) {
-              category = cat;
-              break;
+    try {
+      await withTransaction(async (client) => {
+        // Fetch Retained Earnings once (needed for all rows)
+        const { rows: eq } = await client.query(
+          "select id from accounts where company_id=$1 and heading='Retained Earnings' and is_system=true limit 1",
+          [companyId]
+        );
+        if (!eq[0]) {
+          throw new Error('Retained Earnings account not found — run company setup first.');
+        }
+        const equityId = eq[0].id;
+
+        for (let i = 0; i < rows.length; i++) {
+          const row = rows[i];
+          console.log(`Processing row ${i + 1}:`, row);
+          try {
+            // Find category for this heading
+            let category = null;
+            for (const [cat, headings] of Object.entries(DEFAULT_HEADINGS)) {
+              if (headings.includes(row.heading)) {
+                category = cat;
+                break;
+              }
             }
-          }
-          if (!category) {
-            throw new Error(`Unknown heading: ${row.heading}`);
-          }
+            if (!category) {
+              throw new Error(`Unknown heading: "${row.heading}". Must exactly match one of: Cash, Bank, Inventory, Accounts Receivable, Fixed Assets, Accounts Payable, Loans, Taxes Payable, Owner's Capital, Owner's Drawings, Retained Earnings, Sales, Service Income, Other Income, Rent, Salary, Electricity, Freight, Office Expenses, Discount Allowed, Cost of Goods Sold.`);
+            }
 
-          // Find or create account
-          let { rows: existing } = await client.query(
-            'select id, name, category from accounts where company_id=$1 and name=$2',
-            [companyId, row.accountName]
-          );
+            // Validate date format strictly: YYYY-MM-DD
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(String(row.date))) {
+              throw new Error(`Invalid date format for account "${row.accountName}" at row ${i + 2}: "${row.date}". Expected YYYY-MM-DD (e.g., 2026-01-01).`);
+            }
 
-          let accountId;
-          if (existing[0]) {
-            accountId = existing[0].id;
-          } else {
-            // Create new account
-            const { rows: created } = await client.query(
-              'insert into accounts (company_id, name, heading, category, is_system) values ($1,$2,$3,$4,false) returning id',
-              [companyId, row.accountName, row.heading, category]
+            // Find or create account
+            let { rows: existing } = await client.query(
+              'select id, name, category from accounts where company_id=$1 and name=$2',
+              [companyId, row.accountName]
             );
-            accountId = created[0].id;
-          }
 
-          // Find Retained Earnings for balancing
-          const { rows: eq } = await client.query(
-            "select id from accounts where company_id=$1 and heading='Retained Earnings' and is_system=true limit 1",
-            [companyId]
-          );
-          if (!eq[0]) {
-            throw new Error('Retained Earnings account not found — run company setup first.');
-          }
-          const equityId = eq[0].id;
+            let accountId;
+            if (existing[0]) {
+              accountId = existing[0].id;
+            } else {
+              // Create new account
+              const { rows: created } = await client.query(
+                'insert into accounts (company_id, name, heading, category, is_system) values ($1,$2,$3,$4,false) returning id',
+                [companyId, row.accountName, row.heading, category]
+              );
+              accountId = created[0].id;
+            }
 
-          // Reverse any previous opening balance for this account
-          const { rows: prevOb } = await client.query(
-            'select * from opening_balances where company_id=$1 and account_id=$2',
-            [companyId, accountId]
-          );
-          if (prevOb[0]?.journal_entry_id) {
-            await reverseJournalEntry(client, prevOb[0].journal_entry_id);
-          }
-
-          const amount = row.amount;
-          if (Math.abs(amount) < 0.005) {
-            // Delete if zero
-            await client.query(
-              'delete from opening_balances where company_id=$1 and account_id=$2',
+            // Reverse any previous opening balance for this account
+            const { rows: prevOb } = await client.query(
+              'select * from opening_balances where company_id=$1 and account_id=$2',
               [companyId, accountId]
             );
-            return { accountName: row.accountName, amount, status: 'skipped (zero)' };
-          }
-
-          // Build journal lines
-          const { isDebitNormal } = require('../services/ledger');
-          const debitNormal = isDebitNormal(category);
-          const absAmount = Math.abs(amount);
-          const isPositive = amount > 0;
-
-          let lines;
-          if (debitNormal) {
-            if (isPositive) {
-              lines = [
-                { accountId, debit: absAmount, credit: 0 },
-                { accountId: equityId, debit: 0, credit: absAmount },
-              ];
-            } else {
-              lines = [
-                { accountId: equityId, debit: absAmount, credit: 0 },
-                { accountId, debit: 0, credit: absAmount },
-              ];
+            if (prevOb[0]?.journal_entry_id) {
+              await reverseJournalEntry(client, prevOb[0].journal_entry_id);
             }
-          } else {
-            if (isPositive) {
-              lines = [
-                { accountId: equityId, debit: absAmount, credit: 0 },
-                { accountId, debit: 0, credit: absAmount },
-              ];
-            } else {
-              lines = [
-                { accountId, debit: absAmount, credit: 0 },
-                { accountId: equityId, debit: 0, credit: absAmount },
-              ];
+
+            const amount = row.amount;
+            if (Math.abs(amount) < 0.005) {
+              // Delete if zero
+              await client.query(
+                'delete from opening_balances where company_id=$1 and account_id=$2',
+                [companyId, accountId]
+              );
+              results.push({ accountName: row.accountName, amount, status: 'skipped (zero)' });
+              continue;
             }
+
+            // Build journal lines
+            const { isDebitNormal } = require('../services/ledger');
+            const debitNormal = isDebitNormal(category);
+            const absAmount = Math.abs(amount);
+            const isPositive = amount > 0;
+
+            let lines;
+            if (debitNormal) {
+              if (isPositive) {
+                lines = [
+                  { accountId, debit: absAmount, credit: 0 },
+                  { accountId: equityId, debit: 0, credit: absAmount },
+                ];
+              } else {
+                lines = [
+                  { accountId: equityId, debit: absAmount, credit: 0 },
+                  { accountId, debit: 0, credit: absAmount },
+                ];
+              }
+            } else {
+              if (isPositive) {
+                lines = [
+                  { accountId: equityId, debit: absAmount, credit: 0 },
+                  { accountId, debit: 0, credit: absAmount },
+                ];
+              } else {
+                lines = [
+                  { accountId, debit: absAmount, credit: 0 },
+                  { accountId: equityId, debit: 0, credit: absAmount },
+                ];
+              }
+            }
+
+            const entry = await postJournal(client, {
+              companyId,
+              date: row.date,
+              memo: `Opening balance — ${row.accountName}`,
+              source: 'Opening Balance Bulk Import',
+              lines,
+              createdBy: req.user.id,
+            });
+
+            // Upsert opening_balances record
+            const { rows: ob } = await client.query(
+              `insert into opening_balances (company_id, account_id, amount, date, journal_entry_id, created_by)
+               values ($1,$2,$3,$4,$5,$6)
+               on conflict (company_id, account_id)
+               do update set amount=$3, date=$4, journal_entry_id=$5, created_by=$6
+               returning *`,
+              [companyId, accountId, amount, row.date, entry?.id || null, req.user.id]
+            );
+
+            await audit(client, {
+              companyId,
+              userId: req.user.id,
+              action: prevOb[0] ? 'update' : 'create',
+              entity: 'opening_balance',
+              entityId: ob[0].id,
+              details: { accountId, accountName: row.accountName, amount, date: row.date, source: 'bulk_import' },
+            });
+
+            results.push({ accountName: row.accountName, amount, status: 'imported' });
+          } catch (err) {
+            console.error(`Error processing row ${i + 2}:`, err);
+            errors.push({ row: i + 2, accountName: row.accountName, error: err.message });
           }
-
-          const entry = await postJournal(client, {
-            companyId,
-            date: row.date,
-            memo: `Opening balance — ${row.accountName}`,
-            source: 'Opening Balance Bulk Import',
-            lines,
-            createdBy: req.user.id,
-          });
-
-          // Upsert opening_balances record
-          const { rows: ob } = await client.query(
-            `insert into opening_balances (company_id, account_id, amount, date, journal_entry_id, created_by)
-             values ($1,$2,$3,$4,$5,$6)
-             on conflict (company_id, account_id)
-             do update set amount=$3, date=$4, journal_entry_id=$5, created_by=$6
-             returning *`,
-            [companyId, accountId, amount, row.date, entry?.id || null, req.user.id]
-          );
-
-          await audit(client, {
-            companyId,
-            userId: req.user.id,
-            action: prevOb[0] ? 'update' : 'create',
-            entity: 'opening_balance',
-            entityId: ob[0].id,
-            details: { accountId, accountName: row.accountName, amount, date: row.date, source: 'bulk_import' },
-          });
-
-          return { accountName: row.accountName, amount, status: 'imported' };
-        });
-        results.push(result);
-      } catch (err) {
-        console.error(`Error processing row ${i + 2}:`, err);
-        errors.push({ row: i + 2, accountName: row.accountName, error: err.message });
-      }
+        }
+      });
+    } catch (err) {
+      console.error('Transaction error:', err);
+      return res.status(400).json({ error: `Failed to process file: ${err.message}` });
     }
 
     res.json({ imported: results.length, errors, results });
