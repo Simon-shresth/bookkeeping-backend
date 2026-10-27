@@ -55,7 +55,7 @@ router.post('/', requireRole('accountant'), async (req, res, next) => {
 
 // DELETE /api/accounts/:id — remove a user-created account only if it has no
 // transactions and is not a system account.
-router.delete('/:id', requireRole('accountant'), async (req, res, next) => {
+router.delete('/:id', requireRole('admin'), async (req, res, next) => {
   try {
     const { rows } = await pool.query(
       'select is_system, name from accounts where id=$1 and company_id=$2',
