@@ -283,6 +283,83 @@ async function getTotalsForPeriod(companyId, from, till) {
   return { revenue, cogs, expenseTotal, ar: arBalance, ap: apBalance, profit: revenue - cogs - expenseTotal };
 }
 
+// Key figures for the Dashboard: monthly and yearly aggregations.
+async function getKeyFigures(companyId, { from, till }) {
+  const params = [companyId];
+  let dateWhere = '';
+  if (from) { params.push(from); dateWhere += ` and je.date >= $${params.length}`; }
+  if (till) { params.push(till); dateWhere += ` and je.date <= $${params.length}`; }
+
+  const { rows } = await pool.query(
+    `select a.id, a.category, a.heading, je.date,
+            sum(jl.debit) as debit, sum(jl.credit) as credit
+     from accounts a
+     join journal_lines jl on jl.account_id = a.id
+     join journal_entries je on je.id = jl.journal_entry_id
+          and je.company_id = a.company_id
+     where a.company_id = $1
+       and a.category in ('Income', 'Expenses', 'Assets', 'Liabilities')
+       ${dateWhere}
+     group by a.id, a.category, a.heading, je.date`,
+    params
+  );
+
+  const toISO = (d) => (d instanceof Date ? d.toISOString().split('T')[0] : String(d));
+  const isDebitNormalCat = (cat) => cat === 'Assets' || cat === 'Expenses';
+
+  const monthly = new Map();
+  const yearly = {
+    cashSales: 0,
+    partialCashSales: 0,
+    creditSales: 0,
+    partialCreditSales: 0,
+    paymentReceived: 0,
+    expenses: 0,
+    accountsPayable: 0,
+    accountsReceivable: 0,
+    grossProfit: 0,
+    netProfit: 0,
+    costOfGoodsSold: 0,
+  };
+
+  for (const r of rows) {
+    const dateStr = toISO(r.date);
+    const [y, m] = dateStr.split('-');
+    const monthKey = `${y}-${m}`;
+    const debit = Number(r.debit || 0);
+    const credit = Number(r.credit || 0);
+    const amount = isDebitNormalCat(r.category) ? debit - credit : credit - debit;
+
+    if (!monthly.has(monthKey)) monthly.set(monthKey, { cashSales: 0, partialCashSales: 0, creditSales: 0, partialCreditSales: 0, paymentReceived: 0, expenses: 0, accountsPayable: 0, accountsReceivable: 0, grossProfit: 0, netProfit: 0, costOfGoodsSold: 0 });
+    const monthData = monthly.get(monthKey);
+
+    if (r.heading === 'Sales' && r.category === 'Income') {
+      if (amount > 0) monthData.cashSales += amount;
+    }
+  }
+
+  return { monthly: Object.fromEntries(monthly), yearly };
+}
+
+module.exports = {
+  isDebitNormal,
+  ensureSubAccount,
+  postJournal,
+  reverseJournalEntry,
+  getAccountBalance,
+  getHeadingBalance,
+  getAllBalances,
+  getAccountLedger,
+  getChartOfAccounts,
+  getTotals,
+  getTotalsForPeriod,
+  getCurrentFiscalYear,
+  getClosedFiscalYears,
+  getBalanceSheet,
+  DEFAULT_HEADINGS,
+  getKeyFigures,
+};
+
 // Returns the company's current open fiscal year, or null if none exists.
 // Reads from the fiscal_years table (migration 012).
 async function getCurrentFiscalYear(companyId) {
