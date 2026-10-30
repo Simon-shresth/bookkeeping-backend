@@ -181,8 +181,7 @@ async function createSaleWithinTx(client, companyId, userId, body) {
 
   if (body.cashSale) {
     paidAmount = total; creditAmount = 0;
-    const lines = [{ accountId: body.accountId, debit: total, credit: 0 }, { accountId: salesAcct, debit: 0, credit: subtotal }];
-    if (discount > 0) lines.push({ accountId: await heading(client, companyId, 'Discount Allowed'), debit: discount, credit: 0 });
+    const lines = [{ accountId: body.accountId, debit: total, credit: 0 }, { accountId: salesAcct, debit: 0, credit: total }];
     if (totalCost > 0) {
       lines.push({ accountId: await heading(client, companyId, 'Cost of Goods Sold'), debit: totalCost, credit: 0 });
       lines.push({ accountId: await heading(client, companyId, 'Inventory'), debit: 0, credit: totalCost });
@@ -191,8 +190,7 @@ async function createSaleWithinTx(client, companyId, userId, body) {
     invoiceJournalId = entry?.id || null;
   } else {
     paidAmount = 0; creditAmount = total; // may be reduced just below if an upfront payment is recorded
-    const lines = [{ accountId: customer.account_id, debit: total, credit: 0 }, { accountId: salesAcct, debit: 0, credit: subtotal }];
-    if (discount > 0) lines.push({ accountId: await heading(client, companyId, 'Discount Allowed'), debit: discount, credit: 0 });
+    const lines = [{ accountId: customer.account_id, debit: total, credit: 0 }, { accountId: salesAcct, debit: 0, credit: total }];
     if (totalCost > 0) {
       lines.push({ accountId: await heading(client, companyId, 'Cost of Goods Sold'), debit: totalCost, credit: 0 });
       lines.push({ accountId: await heading(client, companyId, 'Inventory'), debit: 0, credit: totalCost });
