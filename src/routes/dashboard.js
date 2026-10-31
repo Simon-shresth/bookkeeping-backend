@@ -96,16 +96,14 @@ router.get('/', async (req, res, next) => {
       };
     }));
 
-    // Monthly unfiltered (all-time monthly aggregation from sales_invoices + payments + expenses + purchases)
+    // Monthly sales metrics
     const monthlyQuery = await pool.query(
       `select
          to_char(s.date, 'YYYY-MM') as month,
-         sum(case when s.cash_sale then s.total else 0 end) as cash_sales,
-         sum(case when not s.cash_sale and s.paid_amount > 0 then s.paid_amount else 0 end) as partial_cash,
-         sum(case when not s.cash_sale then s.total else 0 end) as credit_sales,
-         sum(case when not s.cash_sale and s.paid_amount > 0 then s.paid_amount else 0 end) as partial_credit,
-         sum(s.paid_amount) as payment_received,
-         sum(s.total) as gross_sales
+         coalesce(sum(case when s.cash_sale then s.total else 0 end),0) as cash_sales,
+         coalesce(sum(case when not s.cash_sale and s.paid_amount > 0 then s.paid_amount else 0 end),0) as partial_cash,
+         coalesce(sum(case when not s.cash_sale then s.credit_amount else 0 end),0) as credit_sales,
+         coalesce(sum(s.paid_amount),0) as payment_received
        from sales_invoices s
        where s.company_id = $1
        group by to_char(s.date, 'YYYY-MM')
@@ -133,7 +131,7 @@ router.get('/', async (req, res, next) => {
       [companyId]
     );
 
-    // Build monthly figures
+    // Build monthly figures (10 key figures)
     const monthlyMap = {};
     for (const r of monthlyQuery.rows) {
       const m = r.month;
@@ -141,35 +139,81 @@ router.get('/', async (req, res, next) => {
       monthlyMap[m].cashSales = Number(r.cash_sales || 0);
       monthlyMap[m].partialCashSales = Number(r.partial_cash || 0);
       monthlyMap[m].creditSales = Number(r.credit_sales || 0);
-      monthlyMap[m].partialCreditSales = Number(r.partial_credit || 0);
       monthlyMap[m].paymentReceived = Number(r.payment_received || 0);
     }
 
-    // Add expenses
+    // Expenses by month
     for (const r of monthlyExpenses.rows) {
       const m = r.month;
       if (!monthlyMap[m]) monthlyMap[m] = buildKeyFigures();
       monthlyMap[m].expenses = Number(r.total || 0);
     }
 
-    // Add purchases (approximates COGS / AP)
-    for (const r of monthlyPurchases.rows) {
+    // COGS by month from journal entries (heading = 'Cost of Goods Sold')
+    const monthlyCOGS = await pool.query(
+      `select to_char(je.date, 'YYYY-MM') as month, coalesce(sum(jl.debit) - coalesce(sum(jl.credit),0),0) as cogs
+       from journal_lines jl
+       join journal_entries je on je.id = jl.journal_entry_id
+       join accounts a on a.id = jl.account_id
+       where a.heading = 'Cost of Goods Sold' and a.company_id = $1 and je.company_id = $1
+       group by to_char(je.date, 'YYYY-MM')
+       order by month`,
+      [companyId]
+    );
+    for (const r of monthlyCOGS.rows) {
       const m = r.month;
       if (!monthlyMap[m]) monthlyMap[m] = buildKeyFigures();
-      monthlyMap[m].costOfGoodsSold = Number(r.total || 0);
+      monthlyMap[m].costOfGoodsSold = Math.abs(Number(r.cogs || 0));
     }
 
-    // Calculate gross/net profit: gross = cash + partial + credit + partial_credit - COGS
-    // Net = gross - expenses
-    // AR/AP from journal balances at month end (simplified: use totals from ledger)
+    // AR at end of each month (positive balances only per sub-account)
     for (const m of Object.keys(monthlyMap)) {
       const d = monthlyMap[m];
-      const gross = d.cashSales + d.partialCashSales + d.creditSales + d.partialCreditSales - d.costOfGoodsSold;
-      d.grossProfit = gross;
-      d.netProfit = gross - d.expenses;
+      const monthEnd = m + '-31';
+      const [arRes, apRes, payRes] = await Promise.all([
+        pool.query(
+          `select a.id, coalesce(sum(jl.debit),0) - coalesce(sum(jl.credit),0) as bal
+           from accounts a
+           left join journal_lines jl on jl.account_id = a.id
+           left join journal_entries je on je.id = jl.journal_entry_id
+           where a.company_id = $1 and a.category = 'Assets' and a.heading = 'Accounts Receivable'
+             and (je.date <= $2 or je.date is null)
+           group by a.id`,
+          [companyId, monthEnd]
+        ),
+        pool.query(
+          `select a.id, coalesce(sum(jl.credit),0) - coalesce(sum(jl.debit),0) as bal
+           from accounts a
+           left join journal_lines jl on jl.account_id = a.id
+           left join journal_entries je on je.id = jl.journal_entry_id
+           where a.company_id = $1 and a.category = 'Liabilities' and a.heading = 'Accounts Payable'
+             and (je.date <= $2 or je.date is null)
+           group by a.id`,
+          [companyId, monthEnd]
+        ),
+        pool.query(
+          `select coalesce(sum(amount),0) as total from payments
+           where company_id = $1 and type = 'customer_receipt' and to_char(date, 'YYYY-MM') = $2`,
+          [companyId, m]
+        )
+      ]);
+      d.accountsReceivable = arRes.rows.reduce((sum, r) => sum + Math.max(0, Number(r.bal || 0)), 0);
+      d.accountsPayable = apRes.rows.reduce((sum, r) => sum + Math.max(0, Number(r.bal || 0)), 0);
+      d.paymentReceived += Number(payRes.rows[0]?.total || 0);
     }
 
-    const monthly = monthlyMap;
+    // Gross / Net profit
+    for (const m of Object.keys(monthlyMap)) {
+      const d = monthlyMap[m];
+      const revenue = d.cashSales + d.partialCashSales + d.creditSales;
+      d.grossProfit = revenue - d.costOfGoodsSold;
+      d.netProfit = d.grossProfit - d.expenses;
+    }
+
+    // Remove partialCreditSales from output (replaced by creditSales using credit_amount)
+    for (const m of Object.keys(monthlyMap)) {
+      delete monthlyMap[m].partialCreditSales;
+    }
 
     // Yearly calculations (from fiscal year start to today, or all-time if no fy)
     const yearStartStr = fyStart || '1900-01-01';
@@ -178,13 +222,23 @@ router.get('/', async (req, res, next) => {
     // Yearly sales metrics from sales_invoices
     const yearlySales = await pool.query(
       `select
-         coalesce(sum(case when s.cash_sale then s.total else 0 end), 0) as cash_sales,
-         coalesce(sum(case when not s.cash_sale and s.paid_amount > 0 then s.paid_amount else 0 end), 0) as partial_cash,
-         coalesce(sum(case when not s.cash_sale then s.total else 0 end), 0) as credit_sales,
-         coalesce(sum(case when not s.cash_sale and s.paid_amount > 0 then s.paid_amount else 0 end), 0) as partial_credit,
-         coalesce(sum(s.paid_amount), 0) as payment_received
+         coalesce(sum(case when s.cash_sale then s.total else 0 end),0) as cash_sales,
+         coalesce(sum(case when not s.cash_sale and s.paid_amount > 0 then s.paid_amount else 0 end),0) as partial_cash,
+         coalesce(sum(case when not s.cash_sale then s.credit_amount else 0 end),0) as credit_sales,
+         coalesce(sum(s.paid_amount),0) as payment_received
        from sales_invoices s
        where s.company_id = $1 and s.date >= $2 and s.date <= $3`,
+      [companyId, yearStartStr, yearTillStr]
+    );
+
+    // Yearly COGS from Cost of Goods Sold journal account
+    const yearlyCOGS = await pool.query(
+      `select coalesce(sum(jl.debit) - coalesce(sum(jl.credit),0),0) as cogs
+       from journal_lines jl
+       join journal_entries je on je.id = jl.journal_entry_id
+       join accounts a on a.id = jl.account_id
+       where a.heading = 'Cost of Goods Sold' and a.company_id = $1 and je.company_id = $1
+         and je.date >= $2 and je.date <= $3`,
       [companyId, yearStartStr, yearTillStr]
     );
 
@@ -199,21 +253,39 @@ router.get('/', async (req, res, next) => {
     );
 
     // AR/AP balances as of year end (or today)
-    const arBal = await pool.query(
-      `select coalesce(sum(jl.debit),0) as debit, coalesce(sum(jl.credit),0) as credit
-       from accounts a left join journal_lines jl on jl.account_id = a.id left join journal_entries je on je.id = jl.journal_entry_id
-       where a.company_id = $1 and a.category = 'Assets' and a.heading = 'Accounts Receivable' and (je.date <= $2 or je.date is null)`,
+    // AR is Assets (Debit normal: debit - credit). Summing absolute balances of ALL AR accounts.
+    const arBalRes = await pool.query(
+      `select a.id, coalesce(sum(jl.debit),0) as debit, coalesce(sum(jl.credit),0) as credit
+       from accounts a
+       left join journal_lines jl on jl.account_id = a.id
+       left join journal_entries je on je.id = jl.journal_entry_id
+       where a.company_id = $1 and a.category = 'Assets' and a.heading = 'Accounts Receivable' and (je.date <= $2 or je.date is null)
+       group by a.id`,
       [companyId, yearTillStr]
     );
-    const arBalVal = Number(arBal.rows[0]?.debit || 0) - Number(arBal.rows[0]?.credit || 0);
+    // AR: only include accounts with positive debit - credit (ignore negative/overpayment balances)
+    const arBalVal = arBalRes.rows.reduce((sum, r) => {
+      const bal = Number(r.debit) - Number(r.credit);
+      return sum + Math.max(0, bal);
+    }, 0);
 
-    const apBal = await pool.query(
-      `select coalesce(sum(jl.debit),0) as debit, coalesce(sum(jl.credit),0) as credit
-       from accounts a left join journal_lines jl on jl.account_id = a.id left join journal_entries je on je.id = jl.journal_entry_id
-       where a.company_id = $1 and a.category = 'Liabilities' and a.heading = 'Accounts Payable' and (je.date <= $2 or je.date is null)`,
+    // AP: only include accounts with positive credit - debit (ignore negative/overpayment balances)
+    const apBalVal = apBalRes.rows.reduce((sum, r) => {
+      const bal = Number(r.credit) - Number(r.debit);
+      return sum + Math.max(0, bal);
+    }, 0);
+
+    // AP is Liabilities (Credit normal: credit - debit). Summing absolute balances of ALL AP accounts.
+    const apBalRes = await pool.query(
+      `select a.id, coalesce(sum(jl.debit),0) as debit, coalesce(sum(jl.credit),0) as credit
+       from accounts a
+       left join journal_lines jl on jl.account_id = a.id
+       left join journal_entries je on je.id = jl.journal_entry_id
+       where a.company_id = $1 and a.category = 'Liabilities' and a.heading = 'Accounts Payable' and (je.date <= $2 or je.date is null)
+       group by a.id`,
       [companyId, yearTillStr]
     );
-    const apBalVal = Number(apBal.rows[0]?.credit || 0) - Number(apBal.rows[0]?.debit || 0);
+    const apBalVal = apBalRes.rows.reduce((sum, r) => sum + (Number(r.credit) - Number(r.debit)), 0);
 
     const yr = yearlySales.rows[0];
     const yrExp = yearlyExpenses.rows[0];
