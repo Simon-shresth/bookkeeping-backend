@@ -103,6 +103,7 @@ router.get('/', async (req, res, next) => {
          coalesce(sum(case when s.cash_sale then s.total else 0 end),0) as cash_sales,
          coalesce(sum(case when not s.cash_sale and s.paid_amount > 0 then s.paid_amount else 0 end),0) as partial_cash,
          coalesce(sum(case when not s.cash_sale then s.credit_amount else 0 end),0) as credit_sales,
+         coalesce(sum(case when not s.cash_sale and s.paid_amount > 0 then s.total - s.paid_amount else 0 end),0) as partial_credit,
          coalesce(sum(s.paid_amount),0) as payment_received
        from sales_invoices s
        where s.company_id = $1
@@ -225,6 +226,7 @@ router.get('/', async (req, res, next) => {
          coalesce(sum(case when s.cash_sale then s.total else 0 end),0) as cash_sales,
          coalesce(sum(case when not s.cash_sale and s.paid_amount > 0 then s.paid_amount else 0 end),0) as partial_cash,
          coalesce(sum(case when not s.cash_sale then s.credit_amount else 0 end),0) as credit_sales,
+         coalesce(sum(case when not s.cash_sale and s.paid_amount > 0 then s.total - s.paid_amount else 0 end),0) as partial_credit,
          coalesce(sum(s.paid_amount),0) as payment_received
        from sales_invoices s
        where s.company_id = $1 and s.date >= $2 and s.date <= $3`,
