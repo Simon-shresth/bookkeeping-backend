@@ -242,6 +242,13 @@ router.get('/', async (req, res, next) => {
       [companyId, yearStartStr, yearTillStr]
     );
 
+    // Yearly payments received from standalone payments
+    const yearlyPayments = await pool.query(
+      `select coalesce(sum(amount), 0) as total from payments
+       where company_id = $1 and type = 'customer_receipt' and date >= $2 and date <= $3`,
+      [companyId, yearStartStr, yearTillStr]
+    );
+
     const yearlyExpenses = await pool.query(
       `select coalesce(sum(amount), 0) as total from expenses e where e.company_id = $1 and e.date >= $2 and e.date <= $3`,
       [companyId, yearStartStr, yearTillStr]
@@ -253,7 +260,7 @@ router.get('/', async (req, res, next) => {
     );
 
     // AR/AP balances as of year end (or today)
-    // AR is Assets (Debit normal: debit - credit). Summing absolute balances of ALL AR accounts.
+    // AR is Assets (Debit normal: debit - credit). Summing positive balances of all AR sub-accounts.
     const arBalRes = await pool.query(
       `select a.id, coalesce(sum(jl.debit),0) as debit, coalesce(sum(jl.credit),0) as credit
        from accounts a
@@ -263,19 +270,12 @@ router.get('/', async (req, res, next) => {
        group by a.id`,
       [companyId, yearTillStr]
     );
-    // AR: only include accounts with positive debit - credit (ignore negative/overpayment balances)
     const arBalVal = arBalRes.rows.reduce((sum, r) => {
       const bal = Number(r.debit) - Number(r.credit);
       return sum + Math.max(0, bal);
     }, 0);
 
-    // AP: only include accounts with positive credit - debit (ignore negative/overpayment balances)
-    const apBalVal = apBalRes.rows.reduce((sum, r) => {
-      const bal = Number(r.credit) - Number(r.debit);
-      return sum + Math.max(0, bal);
-    }, 0);
-
-    // AP is Liabilities (Credit normal: credit - debit). Summing absolute balances of ALL AP accounts.
+    // AP is Liabilities (Credit normal: credit - debit). Summing positive balances of all AP sub-accounts.
     const apBalRes = await pool.query(
       `select a.id, coalesce(sum(jl.debit),0) as debit, coalesce(sum(jl.credit),0) as credit
        from accounts a
@@ -285,28 +285,31 @@ router.get('/', async (req, res, next) => {
        group by a.id`,
       [companyId, yearTillStr]
     );
-    const apBalVal = apBalRes.rows.reduce((sum, r) => sum + (Number(r.credit) - Number(r.debit)), 0);
+    const apBalVal = apBalRes.rows.reduce((sum, r) => {
+      const bal = Number(r.credit) - Number(r.debit);
+      return sum + Math.max(0, bal);
+    }, 0);
 
     const yr = yearlySales.rows[0];
     const yrExp = yearlyExpenses.rows[0];
-    const yrPur = yearlyPurchases.rows[0];
 
     const yearly = buildKeyFigures();
     yearly.cashSales = Number(yr?.cash_sales || 0);
     yearly.partialCashSales = Number(yr?.partial_cash || 0);
     yearly.creditSales = Number(yr?.credit_sales || 0);
-    yearly.partialCreditSales = Number(yr?.partial_credit || 0);
-    yearly.paymentReceived = Number(yr?.payment_received || 0);
+    yearly.paymentReceived = Number(yr?.payment_received || 0) + Number(yearlyPayments.rows[0]?.total || 0);
     yearly.expenses = Number(yrExp?.total || 0);
-    yearly.costOfGoodsSold = Number(yrPur?.total || 0);
+    yearly.costOfGoodsSold = Math.abs(Number(yearlyCOGS.rows[0]?.cogs || 0));
     yearly.accountsReceivable = arBalVal;
     yearly.accountsPayable = apBalVal;
 
-    const grossYear = yearly.cashSales + yearly.partialCashSales + yearly.creditSales + yearly.partialCreditSales - yearly.costOfGoodsSold;
+    const grossYear = yearly.cashSales + yearly.partialCashSales + yearly.creditSales - yearly.costOfGoodsSold;
     yearly.grossProfit = grossYear;
     yearly.netProfit = grossYear - yearly.expenses;
 
-    res.json({ totals, lowStock, recentTransactions: recent, loanAgeing, keyFigures: { monthly, yearly } });
+    delete yearly.partialCreditSales;
+
+    res.json({ totals, lowStock, recentTransactions: recent, loanAgeing, keyFigures: { monthly: monthlyMap, yearly } });
   } catch (err) { next(err); }
 });
 
