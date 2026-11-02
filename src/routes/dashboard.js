@@ -169,7 +169,7 @@ router.get('/', async (req, res, next) => {
     // AR at end of each month (positive balances only per sub-account)
     for (const m of Object.keys(monthlyMap)) {
       const d = monthlyMap[m];
-      const monthEnd = m + '-31';
+      const monthStart = m + '-01';
       const [arRes, apRes, payRes] = await Promise.all([
         pool.query(
           `select a.id, coalesce(sum(jl.debit),0) - coalesce(sum(jl.credit),0) as bal
@@ -177,9 +177,9 @@ router.get('/', async (req, res, next) => {
            left join journal_lines jl on jl.account_id = a.id
            left join journal_entries je on je.id = jl.journal_entry_id
            where a.company_id = $1 and a.category = 'Assets' and a.heading = 'Accounts Receivable'
-             and (je.date <= $2 or je.date is null)
+             and (je.date < $2::date + interval '1 month' or je.date is null)
            group by a.id`,
-          [companyId, monthEnd]
+          [companyId, monthStart]
         ),
         pool.query(
           `select a.id, coalesce(sum(jl.credit),0) - coalesce(sum(jl.debit),0) as bal
@@ -187,9 +187,9 @@ router.get('/', async (req, res, next) => {
            left join journal_lines jl on jl.account_id = a.id
            left join journal_entries je on je.id = jl.journal_entry_id
            where a.company_id = $1 and a.category = 'Liabilities' and a.heading = 'Accounts Payable'
-             and (je.date <= $2 or je.date is null)
+             and (je.date < $2::date + interval '1 month' or je.date is null)
            group by a.id`,
-          [companyId, monthEnd]
+          [companyId, monthStart]
         ),
         pool.query(
           `select coalesce(sum(amount),0) as total from payments
@@ -215,9 +215,11 @@ router.get('/', async (req, res, next) => {
       delete monthlyMap[m].partialCreditSales;
     }
 
-    // Yearly calculations (from fiscal year start to today, or all-time if no fy)
-    const yearStartStr = fyStart || '1900-01-01';
-    const yearTillStr = yearTill || today;
+    // Yearly calculations (all-time up to today / fiscal year end)
+    // We do NOT restrict by fyStart on the lower bound: a fiscal year is often
+    // created mid-year and its start_date may post-date existing transactions.
+    const yearStartStr = '1900-01-01';
+    const yearTillStr = yearTill ? (yearTill < today ? yearTill : today) : today;
 
     // Yearly sales metrics from sales_invoices
     const yearlySales = await pool.query(
