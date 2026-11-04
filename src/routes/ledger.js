@@ -32,7 +32,10 @@ router.get('/export', async (req, res, next) => {
     if (accountId && accountId !== 'all') {
       const ledger = await getAccountLedger(companyId, accountId, { from, till });
       if (!ledger) return res.status(404).json({ error: 'Account not found' });
-      filename = `ledger-${ledger.account.name.replace(/[^A-Za-z0-9._-]/g, '_')}.xlsx`;
+      const safeAccountName = ledger.account.name.replace(/[^A-Za-z0-9._-]/g, '_');
+      const invoiceRef = ledger.entries.find(e => e.reference)?.reference || '';
+      const safeInvoice = invoiceRef ? invoiceRef.replace(/[^A-Za-z0-9._-]/g, '_') + '-' : '';
+      filename = `${safeInvoice}ledger-${safeAccountName}.xlsx`;
 
       // Format entries: Date, Account Headings, Account Name, Debit, Credit, Source, Memo/Reference
       rowsData = ledger.entries.map((e) => ({
@@ -136,8 +139,10 @@ router.get('/:accountId/pdf', async (req, res, next) => {
     });
 
     const safeName = ledger.account.name.replace(/[^A-Za-z0-9._-]/g, '_');
+    const invoiceRef = ledger.entries.find(e => e.reference)?.reference || '';
+    const safeInvoice = invoiceRef ? invoiceRef.replace(/[^A-Za-z0-9._-]/g, '_') + '-' : '';
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="ledger-${safeName}.pdf"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${safeInvoice}ledger-${safeName}.pdf"`);
     res.send(pdf);
   } catch (err) { next(err); }
 });
