@@ -111,12 +111,14 @@ router.get('/', async (req, res, next) => {
       [companyId]
     );
 
-    // Expense totals by month
+    // Expense totals by month from journal entries for expense category accounts
     const monthlyExpenses = await pool.query(
-      `select to_char(e.date, 'YYYY-MM') as month, sum(e.amount) as total
-       from expenses e
-       where e.company_id = $1
-       group by to_char(e.date, 'YYYY-MM')
+      `select to_char(je.date, 'YYYY-MM') as month, coalesce(sum(jl.debit) - coalesce(sum(jl.credit),0), 0) as total
+       from journal_lines jl
+       join journal_entries je on je.id = jl.journal_entry_id
+       join accounts a on a.id = jl.account_id
+       where a.company_id = $1 and je.company_id = $1 and a.category = 'Expenses' and a.heading != 'Cost of Goods Sold'
+       group by to_char(je.date, 'YYYY-MM')
        order by month`,
       [companyId]
     );
@@ -252,7 +254,12 @@ router.get('/', async (req, res, next) => {
     );
 
     const yearlyExpenses = await pool.query(
-      `select coalesce(sum(amount), 0) as total from expenses e where e.company_id = $1 and e.date >= $2 and e.date <= $3`,
+      `select coalesce(sum(jl.debit) - coalesce(sum(jl.credit), 0), 0) as total
+       from journal_lines jl
+       join journal_entries je on je.id = jl.journal_entry_id
+       join accounts a on a.id = jl.account_id
+       where a.company_id = $1 and je.company_id = $1 and a.category = 'Expenses' and a.heading != 'Cost of Goods Sold'
+         and je.date >= $2 and je.date <= $3`,
       [companyId, yearStartStr, yearTillStr]
     );
 
