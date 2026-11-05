@@ -160,7 +160,12 @@ router.post('/import', upload.single('file'), async (req, res, next) => {
           'Discount Allowed': 'Expenses',
           'Cost of Goods Sold': 'Expenses'
         };
-        const category = categoryMap[heading] || 'Expenses';
+        // Normalize heading lookup (case-insensitive and trimming)
+        const normalizedHeading = Object.keys(categoryMap).find(
+          h => h.toLowerCase() === String(heading).trim().toLowerCase()
+        );
+        const category = normalizedHeading ? categoryMap[normalizedHeading] : 'Expenses';
+        const finalHeading = normalizedHeading || heading;
 
         // Check if account exists case-insensitively, otherwise create it
         let accRes = await client.query(
@@ -173,7 +178,7 @@ router.post('/import', upload.single('file'), async (req, res, next) => {
         } else {
           const insAcc = await client.query(
             'insert into accounts (company_id, name, heading, category, is_system) values ($1, $2, $3, $4, false) returning id',
-            [companyId, accountName, heading, category]
+            [companyId, accountName, finalHeading, category]
           );
           accountId = insAcc.rows[0].id;
         }

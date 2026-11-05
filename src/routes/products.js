@@ -66,4 +66,44 @@ router.delete('/:id', requireRole('manager'), async (req, res, next) => {
   }
 });
 
+router.get('/:id/movements', async (req, res, next) => {
+  try {
+    const productId = req.params.id;
+    const companyId = req.user.company_id;
+
+    // Verify product belongs to company
+    const prodRes = await pool.query('select * from products where id = $1 and company_id = $2', [productId, companyId]);
+    const product = prodRes.rows[0];
+    if (!product) return res.status(404).json({ error: 'Product not found' });
+
+    // Fetch sales lines where this product was sold (reduced)
+    const salesRes = await pool.query(
+      `select s.date, s.invoice_number as bill_number, sl.qty as quantity_reduced, c.name as party_name, 'Sale' as type
+       from sales_invoice_lines sl
+       join sales_invoices s on s.id = sl.sales_invoice_id
+       join customers c on c.id = s.customer_id
+       where sl.product_id = $1 and s.company_id = $2
+       order by s.date asc, s.created_at asc`,
+      [productId, companyId]
+    );
+
+    // Fetch purchase lines where this product was purchased (added)
+    const purchasesRes = await pool.query(
+      `select p.date, p.invoice_number as bill_number, pl.qty as quantity_added, s.name as party_name, 'Purchase' as type
+       from purchase_invoice_lines pl
+       join purchase_invoices p on p.id = pl.purchase_invoice_id
+       join suppliers s on s.id = p.supplier_id
+       where pl.product_id = $1 and p.company_id = $2
+       order by p.date asc, p.created_at asc`,
+      [productId, companyId]
+    );
+
+    res.json({
+      product,
+      salesMovements: salesRes.rows,
+      purchaseMovements: purchasesRes.rows,
+    });
+  } catch (err) { next(err); }
+});
+
 module.exports = router;
