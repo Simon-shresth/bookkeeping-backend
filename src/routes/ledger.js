@@ -113,6 +113,9 @@ router.post('/import', upload.single('file'), async (req, res, next) => {
     let importedCount = 0;
 
     await withTransaction(async (client) => {
+      // Group rows by date (and source/memo if desired, or all rows of the same date)
+      const groupedByDate = {};
+
       for (const r of rows) {
         let dateStr = r['Date'];
         if (typeof dateStr === 'number') {
@@ -175,20 +178,28 @@ router.post('/import', upload.single('file'), async (req, res, next) => {
           accountId = insAcc.rows[0].id;
         }
 
-        const lines = [
-          { accountId: accountId, debit, credit }
-        ];
+        if (!groupedByDate[date]) {
+          groupedByDate[date] = {
+            source,
+            memo: memoRef,
+            lines: []
+          };
+        }
 
+        groupedByDate[date].lines.push({ accountId, debit, credit });
+        importedCount++;
+      }
+
+      // Post each date group as a single journal entry with multiple lines
+      for (const [date, group] of Object.entries(groupedByDate)) {
         await postJournal(client, {
           companyId,
           date,
-          memo: memoRef,
-          source,
-          lines,
+          memo: group.memo,
+          source: group.source,
+          lines: group.lines,
           createdBy: userId
         });
-
-        importedCount++;
       }
     });
 
