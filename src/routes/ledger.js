@@ -89,6 +89,123 @@ router.get('/export', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage() });
+const { withTransaction } = require('../db');
+const { postJournal } = require('../services/ledger');
+
+// POST /api/ledger/import
+router.post('/import', upload.single('file'), async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const companyId = req.user.company_id;
+    const userId = req.user.id;
+
+    const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
+    const sheetName = workbook.SheetNames[0];
+    const sheet = workbook.Sheets[sheetName];
+    const rows = XLSX.utils.sheet_to_json(sheet);
+
+    if (!rows || rows.length === 0) {
+      return res.status(400).json({ error: 'Excel file is empty or missing data' });
+    }
+
+    let importedCount = 0;
+
+    await withTransaction(async (client) => {
+      for (const r of rows) {
+        const date = r['Date'];
+        const heading = r['Account Headings'] || 'Office Expenses';
+        const accountName = r['Account Name'];
+        const debit = Number(r['Debit'] || 0);
+        const credit = Number(r['Credit'] || 0);
+        const source = r['Source'] || 'Import';
+        const memoRef = r['Memo/Reference'] || 'Imported entry';
+
+        if (!date || !accountName || (debit === 0 && credit === 0)) continue;
+
+        // Determine category based on heading or default to Expenses
+        const categoryMap = {
+          'Cash': 'Assets',
+          'Bank': 'Assets',
+          'Inventory': 'Assets',
+          'Accounts Receivable': 'Assets',
+          'Fixed Assets': 'Assets',
+          'Accounts Payable': 'Liabilities',
+          'Loans': 'Liabilities',
+          'Taxes Payable': 'Liabilities',
+          "Owner's Capital": 'Equity',
+          "Owner's Drawings": 'Equity',
+          'Retained Earnings': 'Equity',
+          'Sales': 'Income',
+          'Service Income': 'Income',
+          'Other Income': 'Income',
+          'Rent': 'Expenses',
+          'Salary': 'Expenses',
+          'Electricity': 'Expenses',
+          'Freight': 'Expenses',
+          'Office Expenses': 'Expenses',
+          'Discount Allowed': 'Expenses',
+          'Cost of Goods Sold': 'Expenses'
+        };
+        const category = categoryMap[heading] || 'Expenses';
+
+        // Check if account exists, otherwise create it
+        let accRes = await client.query(
+          'select id from accounts where company_id = $1 and name = $2',
+          [companyId, accountName]
+        );
+        let accountId;
+        if (accRes.rows[0]) {
+          accountId = accRes.rows[0].id;
+        } else {
+          const insAcc = await client.query(
+            'insert into accounts (company_id, name, heading, category, is_system) values ($1, $2, $3, $4, false) returning id',
+            [companyId, accountName, heading, category]
+          );
+          accountId = insAcc.rows[0].id;
+        }
+
+        // To keep journal entries balanced, we need an offsetting account if only one line is given per row,
+        // or post full lines if provided. In general ledger export, each row is a line. We balance against Opening Balance / Retained Earnings or Cash if needed.
+        // Let's create a balanced entry: target account debit/credit, and offsetting Cash/Retained Earnings account.
+        const defaultOffsetHeading = debit > 0 ? 'Cash' : 'Sales';
+        let offsetAccRes = await client.query(
+          'select id from accounts where company_id = $1 and heading = $2 limit 1',
+          [companyId, defaultOffsetHeading]
+        );
+        let offsetAccountId = offsetAccRes.rows[0]?.id;
+        if (!offsetAccountId) {
+          const anyAcc = await client.query('select id from accounts where company_id = $1 limit 1', [companyId]);
+          offsetAccountId = anyAcc.rows[0]?.id;
+        }
+
+        if (!offsetAccountId) continue;
+
+        const lines = [
+          { accountId: accountId, debit, credit },
+          { accountId: offsetAccountId, debit: credit, credit: debit }
+        ];
+
+        await postJournal(client, {
+          companyId,
+          date,
+          memo: memoRef,
+          source,
+          lines,
+          createdBy: userId
+        });
+
+        importedCount++;
+      }
+    });
+
+    res.json({ success: true, importedCount });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/ledger/:accountId?from=YYYY-MM-DD&till=YYYY-MM-DD&allYears=true
 // By default, limits to the current fiscal year: opening balance = sum of all
 // journal lines before the fiscal year start; only current-year entries are
