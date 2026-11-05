@@ -114,7 +114,16 @@ router.post('/import', upload.single('file'), async (req, res, next) => {
 
     await withTransaction(async (client) => {
       for (const r of rows) {
-        const date = r['Date'];
+        let dateStr = r['Date'];
+        if (typeof dateStr === 'number') {
+          // Excel serial date to YYYY-MM-DD
+          const utcDays = Math.floor(dateStr - 25569);
+          const dateObj = new Date(utcDays * 86400 * 1000);
+          dateStr = dateObj.toISOString().split('T')[0];
+        } else if (dateStr) {
+          dateStr = String(dateStr).trim().split(' ')[0];
+        }
+        const date = dateStr;
         const heading = r['Account Headings'] || 'Office Expenses';
         const accountName = r['Account Name'];
         const debit = Number(r['Debit'] || 0);
