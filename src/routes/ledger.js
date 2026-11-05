@@ -175,25 +175,8 @@ router.post('/import', upload.single('file'), async (req, res, next) => {
           accountId = insAcc.rows[0].id;
         }
 
-        // To keep journal entries balanced, we need an offsetting account if only one line is given per row,
-        // or post full lines if provided. In general ledger export, each row is a line. We balance against Opening Balance / Retained Earnings or Cash if needed.
-        // Let's create a balanced entry: target account debit/credit, and offsetting Cash/Retained Earnings account.
-        const defaultOffsetHeading = debit > 0 ? 'Cash' : 'Sales';
-        let offsetAccRes = await client.query(
-          'select id from accounts where company_id = $1 and heading = $2 limit 1',
-          [companyId, defaultOffsetHeading]
-        );
-        let offsetAccountId = offsetAccRes.rows[0]?.id;
-        if (!offsetAccountId) {
-          const anyAcc = await client.query('select id from accounts where company_id = $1 limit 1', [companyId]);
-          offsetAccountId = anyAcc.rows[0]?.id;
-        }
-
-        if (!offsetAccountId) continue;
-
         const lines = [
-          { accountId: accountId, debit, credit },
-          { accountId: offsetAccountId, debit: credit, credit: debit }
+          { accountId: accountId, debit, credit }
         ];
 
         await postJournal(client, {

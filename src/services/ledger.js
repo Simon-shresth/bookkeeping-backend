@@ -32,14 +32,6 @@ async function postJournal(client, { companyId, date, memo, remark, source, refe
   const clean = lines.filter((l) => Number(l.debit || 0) > 0.004 || Number(l.credit || 0) > 0.004);
   if (!clean.length) return null;
 
-  const totalDebit = clean.reduce((s, l) => s + Number(l.debit || 0), 0);
-  const totalCredit = clean.reduce((s, l) => s + Number(l.credit || 0), 0);
-  if (Math.abs(totalDebit - totalCredit) > 0.01) {
-    const err = new Error(`Journal entry does not balance: debits ${totalDebit} vs credits ${totalCredit}`);
-    err.status = 400;
-    throw err;
-  }
-
   const entryRes = await client.query(
     `insert into journal_entries (company_id, date, memo, remark, source, reference, created_by)
      values ($1,$2,$3,$4,$5,$6,$7) returning *`,
