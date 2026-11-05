@@ -159,9 +159,9 @@ router.post('/import', upload.single('file'), async (req, res, next) => {
         };
         const category = categoryMap[heading] || 'Expenses';
 
-        // Check if account exists, otherwise create it
+        // Check if account exists case-insensitively, otherwise create it
         let accRes = await client.query(
-          'select id from accounts where company_id = $1 and name = $2',
+          'select id from accounts where company_id = $1 and lower(name) = lower($2)',
           [companyId, accountName]
         );
         let accountId;
