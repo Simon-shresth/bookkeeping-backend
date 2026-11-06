@@ -190,18 +190,12 @@ async function getChartOfAccounts(companyId) {
   for (const [category, headings] of Object.entries(DEFAULT_HEADINGS)) {
     const headingRows = [];
     for (const heading of headings) {
-      if (heading === 'Accounts Receivable' || heading === 'Accounts Payable') {
-        const accs = accounts.filter((a) => a.heading === heading);
-        const bal = accs.reduce((s, a) => s + (balances.get(a.id) || 0), 0);
-        headingRows.push({ heading, collapsed: true, balance: bal, subAccountCount: accs.length });
-      } else {
-        const accs = accounts.filter((a) => a.heading === heading);
-        headingRows.push({
-          heading,
-          collapsed: false,
-          accounts: accs.map((a) => ({ id: a.id, name: a.name, is_system: a.is_system, balance: balances.get(a.id) || 0 })),
-        });
-      }
+      const accs = accounts.filter((a) => a.heading === heading);
+      headingRows.push({
+        heading,
+        collapsed: false,
+        accounts: accs.map((a) => ({ id: a.id, name: a.name, is_system: a.is_system, balance: balances.get(a.id) || 0 })),
+      });
     }
     result.push({ category, headings: headingRows });
   }
