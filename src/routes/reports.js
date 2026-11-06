@@ -1,6 +1,6 @@
 const express = require('express');
 const { pool } = require('../db');
-const { getTotals, getBalanceSheet } = require('../services/ledger');
+const { getTotals, getBalanceSheet, getBalanceSheetByHeadings } = require('../services/ledger');
 
 const router = express.Router();
 
@@ -20,7 +20,7 @@ router.get('/profit-and-loss', async (req, res, next) => {
 // GET /api/reports/balance-sheet
 router.get('/balance-sheet', async (req, res, next) => {
   try {
-    res.json(await getBalanceSheet(req.user.company_id));
+    res.json(await getBalanceSheetByHeadings(req.user.company_id));
   } catch (err) { next(err); }
 });
 

@@ -379,26 +379,25 @@ async function getTotals(companyId, opts = {}) {
   return getTotalsForPeriod(companyId, fy.start_date, fy.end_date);
 }
 
-async function getBalanceSheet(companyId) {
+async function getBalanceSheetByHeadings(companyId) {
   const balances = await getAllBalances(companyId);
   const { rows: accounts } = await pool.query(
-    'select id, name, category from accounts where company_id=$1',
+    'select id, name, heading, category from accounts where company_id=$1',
     [companyId]
   );
 
-  const byCategory = (cat) =>
-    accounts
-      .filter((a) => a.category === cat)
-      .map((a) => ({ name: a.name, balance: balances.get(a.id) || 0 }));
+  const getHeadingRows = (categoryHeadings) => {
+    return categoryHeadings.map((heading) => {
+      const accs = accounts.filter((a) => a.heading === heading);
+      const balance = accs.reduce((sum, a) => sum + (balances.get(a.id) || 0), 0);
+      return { heading, balance };
+    });
+  };
 
-  const assets = byCategory('Assets');
-  const liabilities = byCategory('Liabilities');
-  const equityAccounts = byCategory('Equity');
+  const assetHeadings = getHeadingRows(DEFAULT_HEADINGS.Assets);
+  const liabilityHeadings = getHeadingRows(DEFAULT_HEADINGS.Liabilities);
+  const equityHeadings = getHeadingRows(DEFAULT_HEADINGS.Equity);
 
-  // Earnings folded into equity:
-  // - closedYearsEarnings: net profit across all closed fiscal years, rolled
-  //   into Retained Earnings (no posted closing entry; computed on demand).
-  // - currentEarnings: net profit for the current open fiscal year only.
   const currentFy = await getCurrentFiscalYear(companyId);
   const closedYears = await getClosedFiscalYears(companyId);
 
@@ -413,22 +412,25 @@ async function getBalanceSheet(companyId) {
     const t = await getTotalsForPeriod(companyId, currentFy.start_date, currentFy.end_date);
     currentEarnings = t.profit;
   } else {
-    // No fiscal years set up — fall back to all-time earnings (legacy behaviour)
     const t = await getTotalsForPeriod(companyId, undefined, undefined);
     currentEarnings = t.profit;
   }
 
-  const totalAssets = assets.reduce((s, a) => s + a.balance, 0);
-  const totalLiabilities = liabilities.reduce((s, a) => s + a.balance, 0);
-  const totalEquity = equityAccounts.reduce((s, a) => s + a.balance, 0)
+  const totalAssets = assetHeadings.reduce((s, h) => s + h.balance, 0);
+  const totalLiabilities = liabilityHeadings.reduce((s, h) => s + h.balance, 0);
+  const totalEquity = equityHeadings.reduce((s, h) => s + h.balance, 0)
     + closedYearsEarnings
     + currentEarnings;
 
   return {
-    assets, liabilities, equityAccounts,
+    assets: assetHeadings,
+    liabilities: liabilityHeadings,
+    equityAccounts: equityHeadings,
     currentEarnings,
     closedYearsEarnings,
-    totalAssets, totalLiabilities, totalEquity,
+    totalAssets,
+    totalLiabilities,
+    totalEquity,
     balanced: Math.abs(totalAssets - (totalLiabilities + totalEquity)) < 0.01,
   };
 }
