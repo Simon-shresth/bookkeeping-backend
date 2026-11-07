@@ -327,25 +327,6 @@ async function getKeyFigures(companyId, { from, till }) {
   return { monthly: Object.fromEntries(monthly), yearly };
 }
 
-module.exports = {
-  isDebitNormal,
-  ensureSubAccount,
-  postJournal,
-  reverseJournalEntry,
-  getAccountBalance,
-  getHeadingBalance,
-  getAllBalances,
-  getAccountLedger,
-  getChartOfAccounts,
-  getTotals,
-  getTotalsForPeriod,
-  getCurrentFiscalYear,
-  getClosedFiscalYears,
-  getBalanceSheet,
-  DEFAULT_HEADINGS,
-  getKeyFigures,
-};
-
 // Returns the company's current open fiscal year, or null if none exists.
 // Reads from the fiscal_years table (migration 012).
 async function getCurrentFiscalYear(companyId) {
@@ -435,6 +416,8 @@ async function getBalanceSheetByHeadings(companyId) {
   };
 }
 
+const getBalanceSheet = getBalanceSheetByHeadings;
+
 module.exports = {
   isDebitNormal,
   ensureSubAccount,
@@ -450,5 +433,7 @@ module.exports = {
   getCurrentFiscalYear,
   getClosedFiscalYears,
   getBalanceSheet,
+  getBalanceSheetByHeadings,
   DEFAULT_HEADINGS,
+  getKeyFigures,
 };
