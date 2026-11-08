@@ -6,10 +6,10 @@ const { postJournal, reverseJournalEntry } = require('./ledger');
 // as a generic, unattributed credit against the customer/supplier.
 async function createPaymentWithinTx(client, companyId, userId, body) {
   const acct = await client.query(
-    "select id from accounts where id=$1 and company_id=$2 and heading in ('Cash','Bank')",
+    "select id from accounts where id=$1 and company_id=$2 and heading in ('Cash','Bank','Loans')",
     [body.accountId, companyId]
   );
-  if (!acct.rows[0]) { const e = new Error('Choose a Cash or Bank account.'); e.status = 400; throw e; }
+  if (!acct.rows[0]) { const e = new Error('Choose a Cash, Bank, or Loans account.'); e.status = 400; throw e; }
 
   const isReceipt = body.type === 'customer_receipt';
   const party = await client.query(
