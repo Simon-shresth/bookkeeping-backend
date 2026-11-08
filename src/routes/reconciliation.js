@@ -14,7 +14,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 async function getBankAccount(db, companyId, accountId) {
   if (!UUID.test(String(accountId))) return null;
   const { rows } = await db.query(
-    "select id, name from accounts where id=$1 and company_id=$2 and heading='Bank'",
+    "select id, name from accounts where id=$1 and company_id=$2 and heading in ('Bank', 'Loans')",
     [accountId, companyId]
   );
   return rows[0] || null;
@@ -39,7 +39,7 @@ router.get('/accounts', async (req, res, next) => {
       `select a.id, a.name,
          (select r.statement_date from bank_reconciliations r where r.account_id = a.id order by r.statement_date desc, r.created_at desc limit 1) as last_statement_date,
          (select r.statement_balance from bank_reconciliations r where r.account_id = a.id order by r.statement_date desc, r.created_at desc limit 1) as last_statement_balance
-       from accounts a where a.company_id = $1 and a.heading = 'Bank' order by a.name`,
+       from accounts a where a.company_id = $1 and a.heading in ('Bank', 'Loans') order by a.name`,
       [req.user.company_id]
     );
     res.json(rows);
