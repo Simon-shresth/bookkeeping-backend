@@ -128,7 +128,7 @@ router.post('/import', upload.single('file'), async (req, res, next) => {
         }
         const date = dateStr;
         const heading = r['Account Headings'] || 'Office Expenses';
-        const accountName = r['Account Name'];
+        const accountName = String(r['Account Name'] || '').trim();
         const debit = Number(r['Debit'] || 0);
         const credit = Number(r['Credit'] || 0);
         const source = r['Source'] || 'Import';
@@ -165,22 +165,67 @@ router.post('/import', upload.single('file'), async (req, res, next) => {
           h => h.toLowerCase() === String(heading).trim().toLowerCase()
         );
         const category = normalizedHeading ? categoryMap[normalizedHeading] : 'Expenses';
-        const finalHeading = normalizedHeading || heading;
+        const finalHeading = normalizedHeading || String(heading).trim();
 
         // Check if account exists case-insensitively, otherwise create it
         let accRes = await client.query(
-          'select id from accounts where company_id = $1 and lower(name) = lower($2)',
+          'select id, heading, category from accounts where company_id = $1 and lower(name) = lower($2)',
           [companyId, accountName]
         );
         let accountId;
         if (accRes.rows[0]) {
           accountId = accRes.rows[0].id;
+          if (
+            normalizedHeading &&
+            (accRes.rows[0].heading !== finalHeading || accRes.rows[0].category !== category)
+          ) {
+            await client.query(
+              'update accounts set heading = $1, category = $2 where id = $3',
+              [finalHeading, category, accountId]
+            );
+          }
         } else {
           const insAcc = await client.query(
             'insert into accounts (company_id, name, heading, category, is_system) values ($1, $2, $3, $4, false) returning id',
             [companyId, accountName, finalHeading, category]
           );
           accountId = insAcc.rows[0].id;
+        }
+
+        // If the account belongs under Accounts Receivable, ensure customer record exists
+        if (finalHeading === 'Accounts Receivable') {
+          const custRes = await client.query(
+            'select id, account_id from customers where company_id = $1 and (account_id = $2 or lower(name) = lower($3)) limit 1',
+            [companyId, accountId, accountName]
+          );
+          if (!custRes.rows[0]) {
+            await client.query(
+              'insert into customers (company_id, name, account_id) values ($1, $2, $3) on conflict (company_id, name) do update set account_id = excluded.account_id',
+              [companyId, accountName, accountId]
+            );
+          } else if (custRes.rows[0].account_id !== accountId) {
+            await client.query(
+              'update customers set account_id = $1 where id = $2',
+              [accountId, custRes.rows[0].id]
+            );
+          }
+        } else if (finalHeading === 'Accounts Payable') {
+          // If the account belongs under Accounts Payable, ensure supplier record exists
+          const suppRes = await client.query(
+            'select id, account_id from suppliers where company_id = $1 and (account_id = $2 or lower(name) = lower($3)) limit 1',
+            [companyId, accountId, accountName]
+          );
+          if (!suppRes.rows[0]) {
+            await client.query(
+              'insert into suppliers (company_id, name, account_id) values ($1, $2, $3) on conflict (company_id, name) do update set account_id = excluded.account_id',
+              [companyId, accountName, accountId]
+            );
+          } else if (suppRes.rows[0].account_id !== accountId) {
+            await client.query(
+              'update suppliers set account_id = $1 where id = $2',
+              [accountId, suppRes.rows[0].id]
+            );
+          }
         }
 
         if (!groupedByDate[date]) {
