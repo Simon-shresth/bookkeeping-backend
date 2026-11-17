@@ -38,7 +38,21 @@ const schema = z.object({
   chequeOwner: z.string().trim().min(1),
   isCashed: z.boolean().default(false),
   cashedAmount: z.number().nonnegative().default(0),
-  cashedDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+  cashedDate: z.union([z.string().regex(/^\d{4}-\d{2}-\d{2}$/), z.literal(''), z.null()]).optional().transform((v) => v || null),
+}).transform((data) => {
+  let isCashed = data.isCashed;
+  let cashedAmount = data.cashedAmount;
+  if (isCashed && cashedAmount === 0) {
+    cashedAmount = data.amount;
+  } else if (cashedAmount >= data.amount) {
+    isCashed = true;
+    cashedAmount = data.amount;
+  }
+  return {
+    ...data,
+    isCashed,
+    cashedAmount,
+  };
 });
 
 router.post('/', requireRole('manager'), async (req, res, next) => {
@@ -64,6 +78,40 @@ router.put('/:id', requireRole('manager'), async (req, res, next) => {
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
     await audit(pool, { companyId: req.user.company_id, userId: req.user.id, action: 'update', entity: 'cheque', entityId: rows[0].id, details: body });
+    res.json(rows[0]);
+  } catch (err) { next(err); }
+});
+
+const cashSchema = z.object({
+  isCashed: z.boolean().optional(),
+  cashedAmount: z.number().nonnegative(),
+  cashedDate: z.union([z.string().regex(/^\d{4}-\d{2}-\d{2}$/), z.literal(''), z.null()]).optional().transform((v) => v || null),
+});
+
+router.patch('/:id/cash', requireRole('manager'), async (req, res, next) => {
+  try {
+    const body = cashSchema.parse(req.body);
+    const { rows: existing } = await pool.query(
+      'select * from cheques where id = $1 and company_id = $2',
+      [req.params.id, req.user.company_id]
+    );
+    if (existing.length === 0) return res.status(404).json({ error: 'Not found' });
+    const ch = existing[0];
+    const totalAmount = Number(ch.amount);
+    let cashedAmount = body.cashedAmount;
+    let isCashed = body.isCashed ?? (cashedAmount >= totalAmount);
+    if (isCashed && cashedAmount === 0) {
+      cashedAmount = totalAmount;
+    } else if (cashedAmount >= totalAmount) {
+      isCashed = true;
+      cashedAmount = totalAmount;
+    }
+    const { rows } = await pool.query(
+      `update cheques set is_cashed = $1, cashed_amount = $2, cashed_date = $3
+       where id = $4 and company_id = $5 returning *`,
+      [isCashed, cashedAmount, body.cashedDate || companyToday(), req.params.id, req.user.company_id]
+    );
+    await audit(pool, { companyId: req.user.company_id, userId: req.user.id, action: 'cash_cheque', entity: 'cheque', entityId: rows[0].id, details: body });
     res.json(rows[0]);
   } catch (err) { next(err); }
 });
