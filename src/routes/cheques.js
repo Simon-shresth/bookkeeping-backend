@@ -21,7 +21,7 @@ router.get('/', async (req, res, next) => {
        from cheques c
        join customers cust on cust.id = c.customer_id
        ${where}
-       order by c.cheque_date asc`,
+       order by c.cheque_date asc, c.created_at asc`,
       params
     );
     res.json(rows);
@@ -48,11 +48,7 @@ const schema = z.object({
     isCashed = true;
     cashedAmount = data.amount;
   }
-  return {
-    ...data,
-    isCashed,
-    cashedAmount,
-  };
+  return { ...data, isCashed, cashedAmount };
 });
 
 router.post('/', requireRole('manager'), async (req, res, next) => {
@@ -88,31 +84,60 @@ const cashSchema = z.object({
   cashedDate: z.union([z.string().regex(/^\d{4}-\d{2}-\d{2}$/), z.literal(''), z.null()]).optional().transform((v) => v || null),
 });
 
-router.patch('/:id/cash', requireRole('manager'), async (req, res, next) => {
+// POST /api/cheques/:id/cash — record a cash event (full or partial payment).
+// Updates the cheque's running cumulative state AND appends a row to
+// cheque_cashings so the Cheques screen can show previous partial cash
+// receipts while recording the next payment.
+router.post('/:id/cash', requireRole('manager'), async (req, res, next) => {
   try {
     const body = cashSchema.parse(req.body);
-    const { rows: existing } = await pool.query(
-      'select * from cheques where id = $1 and company_id = $2',
+    const cashDate = body.cashedDate || await companyToday(pool, req.user.company_id);
+    const cheque = await withTransaction(async (client) => {
+      const { rows: existing } = await client.query(
+        'select * from cheques where id = $1 and company_id = $2',
+        [req.params.id, req.user.company_id]
+      );
+      if (existing.length === 0) { const e = new Error('Not found'); e.status = 404; throw e; }
+      const ch = existing[0];
+      const totalAmount = Number(ch.amount);
+      let cashedAmount = body.cashedAmount;
+      let isCashed = body.isCashed ?? (cashedAmount >= totalAmount);
+      if (isCashed && cashedAmount === 0) cashedAmount = totalAmount;
+      else if (cashedAmount >= totalAmount) { isCashed = true; cashedAmount = totalAmount; }
+
+      const { rows } = await client.query(
+        `update cheques set is_cashed = $1, cashed_amount = $2, cashed_date = $3
+         where id = $4 and company_id = $5 returning *`,
+        [isCashed, cashedAmount, cashDate, req.params.id, req.user.company_id]
+      );
+      const updated = rows[0];
+
+      const { rows: cashRows } = await client.query(
+        `insert into cheque_cashings (company_id, cheque_id, cash_date, amount, is_full)
+         values ($1,$2,$3,$4,$5) returning *`,
+        [req.user.company_id, req.params.id, cashDate, cashedAmount, isCashed]
+      );
+
+      await audit(client, { companyId: req.user.company_id, userId: req.user.id, action: 'cash_cheque', entity: 'cheque', entityId: req.params.id, details: { cashedAmount, cashDate, isCashed } });
+
+      return { cheque: updated, cashing: cashRows[0] };
+    });
+    res.json(cheque);
+  } catch (err) { next(err); }
+});
+
+// GET /api/cheques/:id/cashings — prior cash events (full / partial payments)
+// recorded against this cheque, oldest first.
+router.get('/:id/cashings', async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      `select cc.id, cc.cheque_id, cc.cash_date::text as cash_date, cc.amount, cc.is_full, cc.created_at
+       from cheque_cashings cc
+       where cc.cheque_id = $1 and cc.company_id = $2
+       order by cc.cash_date asc, cc.created_at asc`,
       [req.params.id, req.user.company_id]
     );
-    if (existing.length === 0) return res.status(404).json({ error: 'Not found' });
-    const ch = existing[0];
-    const totalAmount = Number(ch.amount);
-    let cashedAmount = body.cashedAmount;
-    let isCashed = body.isCashed ?? (cashedAmount >= totalAmount);
-    if (isCashed && cashedAmount === 0) {
-      cashedAmount = totalAmount;
-    } else if (cashedAmount >= totalAmount) {
-      isCashed = true;
-      cashedAmount = totalAmount;
-    }
-    const { rows } = await pool.query(
-      `update cheques set is_cashed = $1, cashed_amount = $2, cashed_date = $3
-       where id = $4 and company_id = $5 returning *`,
-      [isCashed, cashedAmount, body.cashedDate || companyToday(), req.params.id, req.user.company_id]
-    );
-    await audit(pool, { companyId: req.user.company_id, userId: req.user.id, action: 'cash_cheque', entity: 'cheque', entityId: rows[0].id, details: body });
-    res.json(rows[0]);
+    res.json(rows);
   } catch (err) { next(err); }
 });
 
@@ -120,7 +145,7 @@ router.delete('/:id', requireRole('manager'), async (req, res, next) => {
   try {
     const { rows } = await pool.query('delete from cheques where id=$1 and company_id=$2 returning id', [req.params.id, req.user.company_id]);
     if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
-    await audit(pool, { companyId: req.user.company_id, userId: req.user.id, action: 'delete', entity: 'cheque', entityId: req.params.id });
+    await audit(pool, { companyId: req.user.company_id, userId: req.user.id, action: 'delete', entity: 'cheque', entityId: rows[0].id, details: {} });
     res.status(204).end();
   } catch (err) { next(err); }
 });
