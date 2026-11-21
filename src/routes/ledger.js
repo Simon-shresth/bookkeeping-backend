@@ -259,7 +259,7 @@ router.post('/import', upload.single('file'), async (req, res, next) => {
   }
 });
 
-// GET /api/ledger/:accountId?from=YYYY-MM-DD&till=YYYY-MM-DD&allYears=true
+// GET /api/ledger/:accountId?from=YYYY-MM-DD&till=YYYY-MM-DD&allYears=true&page=1&limit=50
 // By default, limits to the current fiscal year: opening balance = sum of all
 // journal lines before the fiscal year start; only current-year entries are
 // shown. Pass allYears=true (or an explicit from) to see prior-year history.
@@ -268,6 +268,9 @@ router.get('/:accountId', async (req, res, next) => {
     const companyId = req.user.company_id;
     let { from, till } = parseRange(req);
     const allYears = req.query.allYears === 'true';
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200);
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const offset = (page - 1) * limit;
 
     // If no explicit from and not allYears, default to current fiscal year start
     if (!from && !allYears) {
@@ -275,9 +278,10 @@ router.get('/:accountId', async (req, res, next) => {
       if (fy) from = fy.start_date;
     }
 
-    const ledger = await getAccountLedger(companyId, req.params.accountId, { from, till });
+    const ledger = await getAccountLedger(companyId, req.params.accountId, { from, till, limit, offset });
     if (!ledger) return res.status(404).json({ error: 'Account not found' });
-    res.json({ ...ledger, from, till });
+    const { totalEntries } = ledger;
+    res.json({ ...ledger, from, till, page, limit, pages: Math.ceil(totalEntries / limit) });
   } catch (err) { next(err); }
 });
 

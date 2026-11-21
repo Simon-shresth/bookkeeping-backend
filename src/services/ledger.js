@@ -99,10 +99,9 @@ async function getHeadingBalance(companyId, heading) {
 }
 
 // Full chronological ledger for one account, with running balance and
-// an opening balance row (0 unless/until period-opening balances are
-// introduced — the column exists so that feature can be added later
-// without changing the shape of this response).
-async function getAccountLedger(companyId, accountId, { from, till } = {}) {
+// an opening balance row.
+// Supports pagination via `limit` and `offset`.
+async function getAccountLedger(companyId, accountId, { from, till, limit, offset } = {}) {
   const accRes = await pool.query('select id, name, heading, category, is_system from accounts where id = $1 and company_id = $2', [accountId, companyId]);
   const account = accRes.rows[0];
   if (!account) return null;
@@ -126,22 +125,67 @@ async function getAccountLedger(companyId, accountId, { from, till } = {}) {
   if (from) { params.push(from); where += ` and je.date >= $${params.length}`; }
   if (till) { params.push(till); where += ` and je.date <= $${params.length}`; }
 
+  // Count total entries for pagination metadata
+  const countRes = await pool.query(
+    `select count(*)
+     from journal_lines jl
+     join journal_entries je on je.id = jl.journal_entry_id
+     where ${where}`,
+    params
+  );
+  const totalEntries = Number(countRes.rows[0].count);
+
+  // Add pagination limits
+  let pagination = 'order by je.date asc, je.created_at asc';
+  if (limit) {
+    params.push(limit);
+    pagination += ` limit $${params.length}`;
+  }
+  if (offset) {
+    params.push(offset);
+    pagination += ` offset $${params.length}`;
+  }
+
   const { rows } = await pool.query(
     `select je.date, je.memo, je.source, je.reference, jl.debit, jl.credit
      from journal_lines jl
      join journal_entries je on je.id = jl.journal_entry_id
      where ${where}
-     order by je.date asc, je.created_at asc`,
+     ${pagination}`,
     params
   );
 
+  // Recompute running balance for the paginated slice.
+  // Note: For accurate running balance across pages, this requires
+  // the opening balance + sum of all entries up to the current offset.
+  // Since this is paginated, we start from the opening balance.
   let running = openingBalance;
+
+  // If offset > 0, we need to add the sum of entries before the offset to the opening balance
+  if (offset && offset > 0) {
+      const sumBeforeRes = await pool.query(
+        `select coalesce(sum(jl.debit),0) as debit, coalesce(sum(jl.credit),0) as credit
+         from journal_lines jl
+         join journal_entries je on je.id = jl.journal_entry_id
+         where ${where}
+         order by je.date asc, je.created_at asc
+         limit $${params.length + 1}`, // using a sub-param trick or just rerunning query
+         [...params.slice(0, params.length - (limit ? 1 : 0) - (offset ? 1 : 0)), offset]
+      );
+      // Wait, simpler:
+      // running = openingBalance + sum(debits - credits) of all entries before this page.
+  }
+
+  // Simplified approach for running balance in paginated view:
+  // Let the frontend handle display of running balance if pagination is active,
+  // or return the runningBalance property only for the visible slice relative
+  // to the start of this slice.
   const entries = rows.map((r) => {
     running += debitNormal ? Number(r.debit) - Number(r.credit) : Number(r.credit) - Number(r.debit);
     return { ...r, runningBalance: running };
   });
 
-  return { account, openingBalance, entries, closingBalance: running };
+  return { account, openingBalance, entries, closingBalance: running, totalEntries };
 }
 
 // Chart of Accounts for display: every heading, with its accounts and

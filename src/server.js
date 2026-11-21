@@ -26,7 +26,6 @@ const auditRoutes = require('./routes/audit');
 const employeesRoutes = require('./routes/employees');
 const salaryRoutes = require('./routes/salary');
 const openingBalancesRoutes = require('./routes/openingBalances');
-const daybookRoutes = require('./routes/daybook');
 const fiscalYearsRoutes = require('./routes/fiscalYears');
 const chequesRoutes = require('./routes/cheques');
 const { pool } = require('./db');
@@ -83,7 +82,6 @@ app.use('/api/audit', auditRoutes);
 app.use('/api/employees', employeesRoutes);
 app.use('/api/salary', salaryRoutes);
 app.use('/api/opening-balances', openingBalancesRoutes);
-app.use('/api/daybook', daybookRoutes);
 app.use('/api/fiscal-years', fiscalYearsRoutes);
 app.use('/api/cheques', chequesRoutes);
 
