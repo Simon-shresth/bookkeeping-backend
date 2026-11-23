@@ -1,4 +1,4 @@
-create table cheques (
+create table if not exists cheques (
   id                uuid primary key default gen_random_uuid(),
   company_id        uuid not null references companies(id) on delete cascade,
   cheque_date       date not null,
@@ -13,5 +13,5 @@ create table cheques (
   cashed_date       date,
   created_at        timestamptz not null default now()
 );
-create index idx_cheques_company on cheques(company_id);
-create index idx_cheques_customer on cheques(customer_id);
+create index if not exists idx_cheques_company on cheques(company_id);
+create index if not exists idx_cheques_customer on cheques(customer_id);

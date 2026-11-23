@@ -5,7 +5,7 @@
 -- Cheques screen can show previous partial cash receipts while recording a
 -- new payment against a cheque.
 
-create table cheque_cashings (
+create table if not exists cheque_cashings (
   id uuid primary key default gen_random_uuid(),
   company_id uuid not null references companies(id) on delete cascade,
   cheque_id uuid not null references cheques(id) on delete cascade,
@@ -15,5 +15,5 @@ create table cheque_cashings (
   created_at timestamptz not null default now()
 );
 
-create index idx_cheque_cashings_company_cheque on cheque_cashings(company_id, cheque_id);
-create index idx_cheque_cashings_cheque on cheque_cashings(cheque_id);
+create index if not exists idx_cheque_cashings_company_cheque on cheque_cashings(company_id, cheque_id);
+create index if not exists idx_cheque_cashings_cheque on cheque_cashings(cheque_id);
