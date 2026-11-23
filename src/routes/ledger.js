@@ -110,6 +110,19 @@ router.post('/import', upload.single('file'), async (req, res, next) => {
       return res.status(400).json({ error: 'Excel file is empty or missing data' });
     }
 
+    // Helper: flexible column lookup (case-insensitive, space-tolerant)
+    const getCol = (row, ...keys) => {
+      for (const key of keys) {
+        const normKey = key.toLowerCase().replace(/\s+/g, '').trim();
+        for (const [k, v] of Object.entries(row)) {
+          if (k.toLowerCase().replace(/\s+/g, '').trim() === normKey) {
+            return v;
+          }
+        }
+      }
+      return undefined;
+    };
+
     let importedCount = 0;
 
     await withTransaction(async (client) => {
@@ -117,7 +130,7 @@ router.post('/import', upload.single('file'), async (req, res, next) => {
       const groupedByDate = {};
 
       for (const r of rows) {
-        let dateStr = r['Date'];
+        let dateStr = getCol(r, 'Date', 'DATE');
         if (typeof dateStr === 'number') {
           // Excel serial date to YYYY-MM-DD
           const utcDays = Math.floor(dateStr - 25569);
@@ -127,12 +140,12 @@ router.post('/import', upload.single('file'), async (req, res, next) => {
           dateStr = String(dateStr).trim().split(' ')[0];
         }
         const date = dateStr;
-        const heading = r['Account Headings'] || 'Office Expenses';
-        const accountName = String(r['Account Name'] || '').trim();
-        const debit = Number(r['Debit'] || 0);
-        const credit = Number(r['Credit'] || 0);
-        const source = r['Source'] || 'Import';
-        const memoRef = r['Memo/Reference'] || 'Imported entry';
+        const heading = getCol(r, 'Account Headings', 'ACCOUNT HEADINGS', 'Heading') || 'Office Expenses';
+        const accountName = String(getCol(r, 'Account Name', 'Account Name') || '').trim();
+        const debit = Number(getCol(r, 'Debit', 'DEBIT') || 0);
+        const credit = Number(getCol(r, 'Credit', 'CREDIT') || 0);
+        const source = getCol(r, 'Source', 'SOURCE') || 'Import';
+        const memoRef = getCol(r, 'Memo/Reference', 'Memo/Reference', 'Memo') || 'Imported entry';
 
         if (!date || !accountName || (debit === 0 && credit === 0)) continue;
 
