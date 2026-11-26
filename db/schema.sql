@@ -14,6 +14,9 @@ create table companies (
   name          text not null,
   currency      text not null default 'NPR',
   fiscal_start  date,
+  vat_enabled   boolean not null default false,
+  vat_rate      numeric(5,2) not null default 13.00,
+  vat_account_id uuid references accounts(id),
   created_at    timestamptz not null default now()
 );
 
@@ -133,6 +136,10 @@ create table sales_invoices (
   payment_account_id uuid references accounts(id),
   journal_entry_id  uuid references journal_entries(id) on delete set null,
   date              date not null,
+  vat_enabled       boolean not null default false,
+  vat_rate          numeric(5,2) not null default 13.00,
+  vat_amount        numeric(14,2) not null default 0,
+  vat_account_id    uuid references accounts(id),
   created_by        uuid references users(id),
   created_at        timestamptz not null default now()
 );
@@ -157,6 +164,10 @@ create table purchase_invoices (
   payment_account_id  uuid references accounts(id),
   journal_entry_id    uuid references journal_entries(id) on delete set null,
   date                date not null,
+  vat_enabled         boolean not null default false,
+  vat_rate            numeric(5,2) not null default 13.00,
+  vat_amount          numeric(14,2) not null default 0,
+  vat_account_id      uuid references accounts(id),
   created_by          uuid references users(id),
   created_at          timestamptz not null default now()
 );

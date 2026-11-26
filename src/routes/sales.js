@@ -117,8 +117,9 @@ const saleSchema = z.object({
   cashSale: z.boolean().default(false),
   paidAmount: z.number().min(0).default(0),
   accountId: z.string().uuid().optional(),
-}).refine((b) => b.cashSale || b.paidAmount <= 0 || !!b.accountId, { message: 'Choose which account the payment went into.' })
-  .refine((b) => !b.cashSale || !!b.accountId, { message: 'Choose which account the cash sale went into.' });
+  vatEnabled: z.boolean().default(false),
+  vatRate: z.number().min(0).max(100).default(0),
+});
 
 // Looks up the ORIGINAL system account for a heading (Sales, Cost of Goods
 // Sold, Inventory, Discount Allowed) — never a custom account someone added
@@ -138,6 +139,13 @@ async function createSaleWithinTx(client, companyId, userId, body) {
   const custRes = await client.query('select * from customers where id=$1 and company_id=$2', [body.customerId, companyId]);
   const customer = custRes.rows[0];
   if (!customer) { const e = new Error('Customer not found'); e.status = 404; throw e; }
+
+  // Get company VAT settings (default to disabled)
+  const { rows: companyRows } = await client.query(
+    'select vat_enabled, vat_rate, vat_account_id from companies where id = $1',
+    [companyId]
+  );
+  const companyVat = companyRows[0] || { vat_enabled: false, vat_rate: 13.00, vat_account_id: null };
 
   let subtotal = 0, totalCost = 0;
   const lineData = [];
@@ -163,11 +171,17 @@ async function createSaleWithinTx(client, companyId, userId, body) {
     const lineCost = Number(product.purchase_price) * baseQty; // cost normalized to base UOM
     subtotal += lineTotal;
     totalCost += lineCost;
-    lineData.push({ product, qty: line.qty, price: line.price, unit: line.unit, baseQty, conversionFactor, lineTotal, lineCost });
+    lineData.push({ product, qty: line.qty, price: line.price, unit: line.unit, baseQty, conversionFactor, lineTotal, lineCost, lineCost });
   }
 
   const discount = Math.min(Math.max(body.discount || 0, 0), subtotal);
-  const total = Math.round((subtotal - discount) * 100) / 100;
+  const taxableAmount = Math.round((subtotal - discount) * 100) / 100;
+
+  // VAT calculation
+  const vatEnabled = body.vatEnabled !== undefined ? body.vatEnabled : companyVat.vat_enabled;
+  const vatRate = body.vatRate !== undefined ? body.vatRate : companyVat.vat_rate;
+  const vatAmount = Math.round((taxableAmount * vatRate / 100) * 100) / 100;
+  const total = Math.round((taxableAmount + vatAmount) * 100) / 100;
 
   for (const l of lineData) {
     await client.query('update products set stock = stock - $1 where id = $2', [l.baseQty, l.product.id]);
@@ -175,13 +189,17 @@ async function createSaleWithinTx(client, companyId, userId, body) {
 
   const date = body.date || await companyToday(client, companyId);
   const salesAcct = await heading(client, companyId, 'Sales');
+  const vatAcct = vatEnabled && companyVat.vat_account_id ? companyVat.vat_account_id : await heading(client, companyId, 'Taxes Payable');
   const invoiceRef = body.invoiceNumber ? ' — Invoice ' + body.invoiceNumber : '';
 
   let paidAmount, creditAmount, invoiceJournalId;
 
   if (body.cashSale) {
     paidAmount = total; creditAmount = 0;
-    const lines = [{ accountId: body.accountId, debit: total, credit: 0 }, { accountId: salesAcct, debit: 0, credit: total }];
+    const lines = [{ accountId: body.accountId, debit: total, credit: 0 }, { accountId: salesAcct, debit: 0, credit: taxableAmount }];
+    if (vatEnabled) {
+      lines.push({ accountId: vatAcct, debit: 0, credit: vatAmount });
+    }
     if (totalCost > 0) {
       lines.push({ accountId: await heading(client, companyId, 'Cost of Goods Sold'), debit: totalCost, credit: 0 });
       lines.push({ accountId: await heading(client, companyId, 'Inventory'), debit: 0, credit: totalCost });
@@ -190,7 +208,10 @@ async function createSaleWithinTx(client, companyId, userId, body) {
     invoiceJournalId = entry?.id || null;
   } else {
     paidAmount = 0; creditAmount = total; // may be reduced just below if an upfront payment is recorded
-    const lines = [{ accountId: customer.account_id, debit: total, credit: 0 }, { accountId: salesAcct, debit: 0, credit: total }];
+    const lines = [{ accountId: customer.account_id, debit: total, credit: 0 }, { accountId: salesAcct, debit: 0, credit: taxableAmount }];
+    if (vatEnabled) {
+      lines.push({ accountId: vatAcct, debit: 0, credit: vatAmount });
+    }
     if (totalCost > 0) {
       lines.push({ accountId: await heading(client, companyId, 'Cost of Goods Sold'), debit: totalCost, credit: 0 });
       lines.push({ accountId: await heading(client, companyId, 'Inventory'), debit: 0, credit: totalCost });
@@ -201,17 +222,18 @@ async function createSaleWithinTx(client, companyId, userId, body) {
 
   const { rows } = await client.query(
     `insert into sales_invoices
-       (company_id, invoice_number, customer_id, subtotal, discount, total, paid_amount, credit_amount, payment_account_id, journal_entry_id, date, cash_sale, created_by)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) returning *`,
-    [companyId, body.invoiceNumber || null, body.customerId, subtotal, discount, total, paidAmount, creditAmount, body.accountId || null, invoiceJournalId, date, body.cashSale, userId]
+       (company_id, invoice_number, customer_id, subtotal, discount, total, paid_amount, credit_amount, payment_account_id, journal_entry_id, date, cash_sale, created_by, vat_enabled, vat_rate, vat_amount, vat_account_id)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) returning *`,
+    [companyId, body.invoiceNumber || null, body.customerId, subtotal, discount, total, paidAmount, creditAmount, body.accountId || null, invoiceJournalId, date, body.cashSale, userId, vatEnabled, vatRate, vatAmount, vatAcct || null]
   );
   const sale = rows[0];
 
   for (const l of lineData) {
+    const lineVat = Math.round((l.lineTotal * vatRate / 100) * 100) / 100;
     await client.query(
-      `insert into sales_invoice_lines (sales_invoice_id, product_id, unit, qty, price, cost, line_total, base_qty, conversion_factor)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [sale.id, l.product.id, l.unit, l.qty, l.price, l.lineCost, l.lineTotal, l.baseQty, l.conversionFactor]
+      `insert into sales_invoice_lines (sales_invoice_id, product_id, unit, qty, price, cost, line_total, base_qty, conversion_factor, vat_amount)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [sale.id, l.product.id, l.unit, l.qty, l.price, l.lineCost, l.lineTotal, l.baseQty, l.conversionFactor, lineVat]
     );
   }
 
@@ -231,6 +253,9 @@ async function createSaleWithinTx(client, companyId, userId, body) {
   }
 
   sale.lines = lineData.map((l) => ({ product_name: l.product.name, unit: l.unit, qty: l.qty, price: l.price, line_total: l.lineTotal, base_qty: l.baseQty }));
+  sale.vat_enabled = vatEnabled;
+  sale.vat_rate = vatRate;
+  sale.vat_amount = vatAmount;
   return sale;
 }
 

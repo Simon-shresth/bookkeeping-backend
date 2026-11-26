@@ -28,6 +28,7 @@ const salaryRoutes = require('./routes/salary');
 const openingBalancesRoutes = require('./routes/openingBalances');
 const fiscalYearsRoutes = require('./routes/fiscalYears');
 const chequesRoutes = require('./routes/cheques');
+const settingsRoutes = require('./routes/settings');
 const { pool } = require('./db');
 
 
@@ -84,6 +85,7 @@ app.use('/api/salary', salaryRoutes);
 app.use('/api/opening-balances', openingBalancesRoutes);
 app.use('/api/fiscal-years', fiscalYearsRoutes);
 app.use('/api/cheques', chequesRoutes);
+app.use('/api/settings', settingsRoutes);
 
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));

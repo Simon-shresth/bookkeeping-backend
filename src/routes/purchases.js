@@ -126,6 +126,8 @@ const purchaseSchema = z.object({
   lines: z.array(lineSchema).min(1, 'Add at least one item.'),
   paidAmount: z.number().min(0).default(0),
   accountId: z.string().uuid().optional(),
+  vatEnabled: z.boolean().default(false),
+  vatRate: z.number().min(0).max(100).default(0),
 }).refine((b) => b.paidAmount <= 0 || !!b.accountId, { message: 'Choose which account the payment went from.' });
 
 // Looks up the ORIGINAL system account for a heading (Sales, Cost of Goods
@@ -146,6 +148,13 @@ async function createPurchaseWithinTx(client, companyId, userId, body) {
   const supRes = await client.query('select * from suppliers where id=$1 and company_id=$2', [body.supplierId, companyId]);
   const supplier = supRes.rows[0];
   if (!supplier) { const e = new Error('Supplier not found'); e.status = 404; throw e; }
+
+  // Get company VAT settings (default to disabled)
+  const { rows: companyRows } = await client.query(
+    'select vat_enabled, vat_rate, vat_account_id from companies where id = $1',
+    [companyId]
+  );
+  const companyVat = companyRows[0] || { vat_enabled: false, vat_rate: 13.00, vat_account_id: null };
 
   let subtotal = 0;
   const lineData = [];
@@ -169,6 +178,7 @@ async function createPurchaseWithinTx(client, companyId, userId, body) {
         qty: line.qty || 1,
         unitPrice: line.unitPrice || 0,
         lineTotal,
+        lineVat: Math.round((lineTotal * (body.vatRate || 0) / 100) * 100) / 100,
       });
     } else {
       // ── Product line ───────────────────────────────────────────────────────
@@ -188,11 +198,15 @@ async function createPurchaseWithinTx(client, companyId, userId, body) {
       }
       const lineTotal = line.unitPrice * line.qty;
       subtotal += lineTotal;
-      lineData.push({ type: 'product', product, qty: line.qty, unitPrice: line.unitPrice, unit: product.unit, lineTotal });
+      lineData.push({ type: 'product', product, qty: line.qty, unitPrice: line.unitPrice, unit: product.unit, lineTotal, lineVat: Math.round((lineTotal * (body.vatRate || 0) / 100) * 100) / 100 });
     }
   }
 
-  const total = Math.round(subtotal * 100) / 100;
+  const taxableAmount = Math.round(subtotal * 100) / 100;
+  const vatEnabled = body.vatEnabled !== undefined ? body.vatEnabled : companyVat.vat_enabled;
+  const vatRate = body.vatRate !== undefined ? body.vatRate : companyVat.vat_rate;
+  const vatAmount = Math.round((taxableAmount * vatRate / 100) * 100) / 100;
+  const total = Math.round((taxableAmount + vatAmount) * 100) / 100;
 
   // Update stock only for product lines
   for (const l of lineData) {
@@ -206,9 +220,13 @@ async function createPurchaseWithinTx(client, companyId, userId, body) {
   const memoBase = `Purchase from ${supplier.name}${invoiceRef}`;
   const memo = body.narration ? `${memoBase} — ${body.narration}` : memoBase;
 
+  // VAT account
+  const vatAcct = vatEnabled && companyVat.vat_account_id ? companyVat.vat_account_id : await heading(client, companyId, 'Taxes Payable');
+
   // Build journal lines:
   // - Product lines: debit Inventory
   // - Service lines: debit the chosen expense/service account
+  // - Debit VAT (if enabled)
   // - Credit full total to Supplier AP
   const invAcct = await heading(client, companyId, 'Inventory');
   const productSubtotal = lineData.filter((l) => l.type === 'product').reduce((s, l) => s + l.lineTotal, 0);
@@ -226,6 +244,9 @@ async function createPurchaseWithinTx(client, companyId, userId, body) {
   for (const [accId, amount] of Object.entries(serviceByAccount)) {
     journalLines.push({ accountId: accId, debit: Math.round(amount * 100) / 100, credit: 0 });
   }
+  if (vatEnabled) {
+    journalLines.push({ accountId: vatAcct, debit: vatAmount, credit: 0 });
+  }
   journalLines.push({ accountId: supplier.account_id, debit: 0, credit: total });
 
   const entry = await postJournal(client, {
@@ -236,11 +257,11 @@ async function createPurchaseWithinTx(client, companyId, userId, body) {
   const { rows } = await client.query(
     `insert into purchase_invoices
        (company_id, invoice_number, pragyapan_number, supplier_id, subtotal, total, paid_amount, credit_amount,
-        payment_account_id, journal_entry_id, date, narration, created_by)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) returning *`,
+        payment_account_id, journal_entry_id, date, narration, created_by, vat_enabled, vat_rate, vat_amount, vat_account_id)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) returning *`,
     [companyId, body.invoiceNumber || null, body.pragyapanNumber || null, body.supplierId,
      subtotal, total, 0, total, body.accountId || null, entry?.id || null, date,
-     body.narration || null, userId]
+     body.narration || null, userId, vatEnabled, vatRate, vatAmount, vatAcct || null]
   );
   const purchase = rows[0];
 
@@ -248,16 +269,16 @@ async function createPurchaseWithinTx(client, companyId, userId, body) {
     if (l.type === 'product') {
       await client.query(
         `insert into purchase_invoice_lines
-           (purchase_invoice_id, product_id, line_type, unit, qty, unit_price, line_total)
-         values ($1,$2,'product',$3,$4,$5,$6)`,
-        [purchase.id, l.product.id, l.unit, l.qty, l.unitPrice, l.lineTotal]
+           (purchase_invoice_id, product_id, line_type, unit, qty, unit_price, line_total, vat_amount)
+         values ($1,$2,'product',$3,$4,$5,$6,$7)`,
+        [purchase.id, l.product.id, l.unit, l.qty, l.unitPrice, l.lineTotal, l.lineVat || 0]
       );
     } else {
       await client.query(
         `insert into purchase_invoice_lines
-           (purchase_invoice_id, line_type, description, account_id, unit, qty, unit_price, line_total)
-         values ($1,'service',$2,$3,'service',$4,$5,$6)`,
-        [purchase.id, l.description, l.accountId, l.qty, l.unitPrice, l.lineTotal]
+           (purchase_invoice_id, line_type, description, account_id, unit, qty, unit_price, line_total, vat_amount)
+         values ($1,'service',$2,$3,'service',$4,$5,$6,$7)`,
+        [purchase.id, l.description, l.accountId, l.qty, l.unitPrice, l.lineTotal, l.lineVat || 0]
       );
     }
   }
